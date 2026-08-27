@@ -1,0 +1,17 @@
+{
+  "assets": [
+    {"id": "clip", "path": "clips/intro.mp4", "type": "video"},
+    {"id": "pic", "path": "images/bg.png", "type": "image"},
+    {"id": "music", "path": "audio/bgm.mp3", "type": "audio"}
+  ],
+  "material": [
+    {"start": 0.0, "end": 3.0, "asset": "clip", "in": 5.0, "out": 8.0},
+    {"start": 3.0, "end": 8.0, "asset": "pic",
+     "crop": {"x": 0.5, "y": 0.5}}
+  ],
+  "bgm": {"asset": "music", "volume": 0.3},
+  "annotations": [
+    {"start": 4.0, "end": 7.0, "x": 0.1, "y": 0.2, "w": 0.5, "h": 0.4,
+     "color": "0xFFFFFF"}
+  ]
+}
