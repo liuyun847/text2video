@@ -3,6 +3,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
 
 # 输出与中间产物
 out/
