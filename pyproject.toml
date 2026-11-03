@@ -5,11 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "text2video"
 version = "0.1.0"
-description = "文案转视频:输入文本生成语音和滚动字幕,合成短视频"
+description = "文案转中间件:输入文本生成音轨、透明字幕轨与素材片段,交给 Remotion 渲染整片"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "edge-tts>=7.2.8",
+    "edge-tts>=7.3.1",
+    "resvg-py>=0.5.0",
 ]
 
 [project.scripts]

@@ -1,7 +1,7 @@
 """布局模块:与"字体 / 字号 / 每行字数"相关的纯计算逻辑。
 
-原先在 cli.py 里,抽取出来供 cli(参数推导)与 render(从 timeline 重现排版)共用,
-避免两处重复推导导致 plan 与 render 结果不一致。
+原先在 cli.py 里,抽取出来供 cli(参数推导)与 produce(从 timeline 重现排版)共用,
+避免两处重复推导导致 plan 与 produce 结果不一致。
 """
 
 from __future__ import annotations

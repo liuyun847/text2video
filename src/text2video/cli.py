@@ -1,14 +1,15 @@
-"""text2video CLI:两阶段工作流(plan 审片 → render 渲染),并保留旧一键用法。
+"""text2video CLI:两阶段工作流(plan 审片 → produce 产出中间件),并保留一键用法。
 
 流水线:文本 → edge-tts(或离线估算/SAPI 本地)逐字时间轴 → 多轨对齐的
-timeline.json / timeline.md / preview.html(人类可读、可单独查看)→ 确认后渲染 MP4。
+timeline.json / timeline.md / preview.html(人类可读、可单独查看)→ 确认后
+produce 产出发给 Remotion 的中间件(音轨 / 透明字幕轨 / 素材片段 / render.json)。
 
 子命令:
-  plan   生成时间线产物(默认离线估算,不联网不渲染)
-  render 读取 timeline.json,真实合成并渲染 MP4(自检不过默认拒绝)
-  cover  生成封面图(背景 + 标题大字,输出 PNG)
-  doctor 环境自检(ffmpeg/ffprobe/字体/edge-tts/SAPI/缓存目录/配置)
-无子命令时保持旧的一键命令行(plan(realtime) + render 一次完成)。
+  plan    生成时间线产物(默认离线估算,不联网)
+  produce 读取 timeline.json(或直接从文案现建),产出中间件(自检不过默认拒绝)
+  cover   生成封面图(背景 + 标题大字,输出 PNG)
+  doctor  环境自检(ffmpeg/ffprobe/字体/edge-tts/SAPI/缓存目录/配置)
+无子命令时保持一键用法(建真实时间轴 + produce 一次完成)。
 参数除命令行外可来自配置文件(text2video.toml,优先级:命令行 > 配置 > 默认)。
 """
 
@@ -29,7 +30,13 @@ from .layout import (
 from .layout import (
     resolve_font as _resolve_font,
 )
-from .render import render_from_timeline, write_timeline_artifacts
+from .produce import (
+    annotate_crop_frames,
+    produce_from_timeline,
+    produce_timeline,
+    synthesize_with_backend,
+    write_timeline_artifacts,
+)
 from .timeline import (
     build_timeline,
     check_material_files,
@@ -41,9 +48,12 @@ from .tts import DEFAULT_VOICE
 
 LOG = logging.getLogger("text2video")
 
+# 产物基名默认值:所有产物都挂在它后面({基名}.audio.mp3 / .render.json / …)
+_DEFAULT_OUT = "output"
+
 
 # ---------------------------------------------------------------------------
-# 参数定义(顶层一键 + plan 子命令共用)
+# 参数定义(顶层一键 + plan/produce/cover 子命令共用)
 # ---------------------------------------------------------------------------
 
 def _add_common_args(p: argparse.ArgumentParser) -> None:
@@ -74,11 +84,13 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
     sub.add_argument("--shadow", type=int, default=1, help="阴影宽度")
     sub.add_argument("--box", action="store_true", help="字幕加半透明底色框")
 
-    vid = p.add_argument_group("画面/合成")
-    vid.add_argument("--out", default="output.mp4", help="输出路径(plan 时作为产物基名)")
+    vid = p.add_argument_group("画幅/背景/编码")
+    vid.add_argument("--out", default=_DEFAULT_OUT,
+                     help=f"产物基名(默认 {_DEFAULT_OUT}):产物为 "
+                          "{基名}.render.json / .audio.mp3 / .subs.webm / .material/ 等")
     vid.add_argument("--materials", metavar="JSON",
                      help="素材清单文件(assets/material/bgm 三段,见 README;"
-                          "素材按段落全屏覆盖 + 可选 BGM 混音)")
+                          "素材按段落铺满画幅并切成独立片段,可选 BGM 混音)")
     aspect = vid.add_mutually_exclusive_group()
     aspect.add_argument("--landscape", dest="aspect", action="store_const",
                         const="landscape", help="横屏 16:9 预设(1920x1080)")
@@ -88,17 +100,15 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
                         const="square", help="方画幅 1:1 预设(1080x1080,默认)")
     vid.add_argument("--width", type=int, default=0, help="画幅宽(默认按预设/1080)")
     vid.add_argument("--height", type=int, default=0, help="画幅高(默认按预设/1080)")
-    vid.add_argument("--fps", type=int, default=60)
+    vid.add_argument("--fps", type=int, default=60, help="帧率(写进 render.json,素材按此帧率规整)")
     vid.add_argument("--transition", type=float, default=0.0,
-                     help="素材段淡入淡出过渡时长(秒),默认 0=硬切")
+                     help="素材段淡入淡出时长(秒),默认 0=硬切;写进 render.json 的 fade")
     vid.add_argument("--bg-color", default="1B1B2A",
-                     help="纯色背景 0xRRGGBB(写 RRGGBB);未指定 --bg-image 时生效")
-    vid.add_argument("--bg-image", help="背景图(缩放裁切铺满画面);指定后优先生效")
-    vid.add_argument("--crf", type=int, default=23, help="x264 质量(小=清晰) 18-28")
-    vid.add_argument("--preset", default="medium", help="x264 预设")
-    vid.add_argument("--audio-bitrate", default="192k", help="输出音频码率")
-    vid.add_argument("--split-tracks", action="store_true",
-                     help="渲染后额外输出纯画面(video.mp4)与纯音频(audio.mp3)")
+                     help="纯色背景:写 RRGGBB(不带 0x),填进 render.json 的 background")
+    vid.add_argument("--bg-image", help="背景图(绝对路径写进 render.json,由消费端铺满)")
+    vid.add_argument("--crf", type=int, default=23, help="素材视频中间件的 x264 质量 18-28")
+    vid.add_argument("--preset", default="medium", help="素材视频中间件的 x264 预设")
+    vid.add_argument("--audio-bitrate", default="192k", help="最终音轨 mp3 码率")
 
     tts2 = p.add_argument_group("TTS/语音来源")
     tts2.add_argument("--tts-backend", choices=("edge", "sapi", "auto"),
@@ -106,53 +116,43 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
                       help="语音引擎:edge=edge-tts 在线(默认);sapi=Windows 本地语音"
                            "(离线,逐字轴近似);auto=优先 edge,失败自动回退 sapi")
     tts2.add_argument("--tts-cache-dir",
-                      help="TTS 缓存目录(默认 %LOCALAPPDATA%\\text2video\\tts_cache)")
+                      help="TTS 缓存目录(默认 %%LOCALAPPDATA%%\\text2video\\tts_cache)")
     tts2.add_argument("--no-tts-cache", action="store_true", help="禁用 TTS 缓存(每次联网合成)")
 
     misc = p.add_argument_group("其他")
     misc.add_argument("--config", help="配置文件 TOML(默认查找当前目录 text2video.toml)")
-    misc.add_argument("--skip-intermediate", action="store_true",
-                      help="合成成功后删除中间文件(mp3/ass)")
     misc.add_argument("--log", default="INFO", help="日志级别 DEBUG/INFO/WARNING")
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="text2video",
-        description="文案转视频:两阶段(plan 审片 → render 渲染),输入文本生成多轨对齐"
-                    "时间线,确认后合成短视频(默认 1:1 方画幅 1080x1080)。",
+        description="文案转中间件:两阶段(plan 审片 → produce 产出),输入文本生成多轨对齐"
+                    "时间线,确认后产出音轨 / 透明字幕轨 / 素材片段 / render.json 交给 Remotion"
+                    "(默认 1:1 方画幅 1080x1080)。",
     )
     _add_common_args(p)
-    subs = p.add_subparsers(title="子命令", dest="command", metavar="{plan, render}")
+    subs = p.add_subparsers(title="子命令", dest="command", metavar="{plan, produce}")
 
     sp = subs.add_parser(
         "plan", parents=[_add_common_args_p()],
-        help="生成多轨对齐的时间线产物(json/md/preview.html),不渲染视频",
+        help="生成多轨对齐的时间线产物(json/md/preview.html),不做合成",
         description="生成时间线中间产物;默认离线估算时间轴(不联网)。",
     )
     sp.add_argument("--real", action="store_true",
                     help="用真实 edge-tts 时间轴(联网,较慢;默认离线估算)")
 
-    r = subs.add_parser(
-        "render",
-        help="读取 timeline.json,真实合成并渲染最终 MP4",
-        description="渲染:从 timeline.json 读取全部参数,真实 TTS 并对齐渲染;"
-                    "自检未通过默认拒绝(可用 --force 跳过)。",
+    pr = subs.add_parser(
+        "produce", parents=[_add_common_args_p()],
+        help="产出 Remotion 中间件:音轨 + 透明字幕轨 + 素材片段 + render.json",
+        description="产出:从 timeline.json 或直接给文案,产出发给 Remotion 的中间件;"
+                    "时间线自检未通过默认拒绝(可用 --force 跳过)。",
     )
-    r.add_argument("--timeline", required=True, help="timeline.json 路径")
-    r.add_argument("--out", default=None, help="输出 mp4 路径(默认=timeline 基名.mp4)")
-    r.add_argument("--force", action="store_true", help="忽略一致性自检错误,强制渲染")
-    r.add_argument("--split-tracks", action="store_true",
-                   help="额外输出纯画面/纯音频两个文件")
-    r.add_argument("--tts-backend", choices=("edge", "sapi", "auto"), default=None,
-                   help="覆盖 timeline 中的语音引擎(默认读 timeline)")
-    r.add_argument("--no-tts-cache", action="store_true", help="禁用 TTS 缓存")
-    r.add_argument("--tts-cache-dir", help="TTS 缓存目录")
-    r.add_argument("--skip-intermediate", action="store_true",
-                   help="渲染后删除中间文件(mp3/ass)")
-    r.add_argument("--config", default=None,
-                   help="配置文件 TOML(仅渲染相关键生效,如 tts_backend/缓存目录)")
-    r.add_argument("--log", default="INFO", help="日志级别 DEBUG/INFO/WARNING")
+    pr.add_argument("--timeline", default=None,
+                    help="timeline.json 路径(与 --text/--file 二选一);缺省则从文案现建")
+    pr.add_argument("--force", action="store_true", help="忽略一致性自检错误,强制产出")
+    # 与顶层共用参数集,但产物基名缺省跟着 --timeline 走(None=由 timeline 路径推导)
+    pr.set_defaults(out=None)
 
     cv = subs.add_parser(
         "cover",
@@ -239,7 +239,7 @@ def resolve_canvas(width: int, height: int, aspect: str | None) -> tuple[int, in
 
 
 def collect_meta(args: argparse.Namespace) -> dict:
-    """把渲染/排版参数收进一份 meta dict,plan 时写入 timeline.json。"""
+    """把排版/编码参数收进一份 meta dict,plan 时写入 timeline.json。"""
     width, height = resolve_canvas(args.width, args.height, args.aspect)
     fontsize = args.font_size or _auto_fontsize(width, height)
     _font_path, font_name = _resolve_font(args.font)  # 未指定时取系统字体的家族名
@@ -265,7 +265,7 @@ def collect_meta(args: argparse.Namespace) -> dict:
 
 
 def _base_from_out(out: str) -> str:
-    """输出基名:剥掉扩展名(plan 产物基名 / legacy 的 mp4 stem)。"""
+    """产物基名:剥掉扩展名(plan/produce 产物都以此为前缀)。"""
     return os.path.splitext(out)[0]
 
 
@@ -287,12 +287,10 @@ def _plan_core(text: str, base: str, meta: dict, *, real: bool,
         file_errors = check_material_files(assets)
         if file_errors:
             raise SystemExit("素材文件缺失:\n" + "\n".join(file_errors))
-        _annotate_crop_frames(assets, material, meta)
+        annotate_crop_frames(assets, material, meta)
     meta["timing_mode"] = "real" if real else "estimate"
     if real:
         audio_abs = f"{base}.mp3"
-        from .render import synthesize_with_backend
-
         timings, used_backend = synthesize_with_backend(
             text, meta=meta, out_audio=audio_abs,
             cache_dir=cache_dir, backend_override=meta.get("tts_backend"),
@@ -309,49 +307,8 @@ def _plan_core(text: str, base: str, meta: dict, *, real: bool,
     return tl, timings, audio_ref
 
 
-def _annotate_crop_frames(
-    assets: list[dict], material: list[dict], meta: dict,
-) -> None:
-    """为带 crop 的素材段探测分辨率,回填 data.frame(窗口相对素材的比例)。
-
-    frame 供审片标注(素材图上画框),纯展示用途;渲染时仍自行探测并计算像素。
-    探测失败(无 ffmpeg/ffprobe、素材损坏)仅告警,不阻塞 plan。
-    """
-    from . import compose
-    from .render import crop_frame
-
-    by_id = {a["id"]: a for a in assets}
-    out_w = int(meta.get("width", 1080))
-    out_h = int(meta.get("height", 1080))
-    try:
-        ffmpeg = compose.find_ffmpeg()
-        ffprobe = compose.find_ffprobe(ffmpeg)
-    except RuntimeError as exc:
-        LOG.warning("未找到 ffmpeg/ffprobe(审片窗口标注缺失): %s", exc)
-        return
-    for seg in material:
-        crop = seg.get("crop")
-        if not crop:
-            continue
-        asset = by_id.get(str(seg.get("asset", "")))
-        if not asset or asset["type"] not in ("video", "image"):
-            continue
-        try:
-            src_w, src_h = compose.probe_dimensions(ffprobe, asset["path"])
-        except RuntimeError as exc:
-            LOG.warning("素材 %r 分辨率探测失败(审片窗口标注缺失): %s",
-                        asset["id"], exc)
-            continue
-        fx, fy, fw, fh = crop_frame(
-            src_w, src_h, out_w, out_h,
-            float(crop.get("x", 0.5)), float(crop.get("y", 0.5)),
-        )
-        seg["frame"] = {"x": round(fx, 4), "y": round(fy, 4),
-                        "w": round(fw, 4), "h": round(fh, 4)}
-
-
 # ---------------------------------------------------------------------------
-# 三个入口
+# 入口实现
 # ---------------------------------------------------------------------------
 
 def default_tts_cache_dir() -> str:
@@ -383,40 +340,44 @@ def run_plan(args: argparse.Namespace) -> int:
     print(checks_report(tl.checks))
     print(f"时间线产物: {base}.timeline.json / {base}.timeline.md / {base}.preview.html")
     if not args.real:
-        print("(估算模式,未含音频;需试听请 --real,或用 render 渲染后复核)")
+        print("(估算模式,未含音频;需试听请 --real,或直接 produce 产出中间件)")
     return 0
 
 
-def run_render(args: argparse.Namespace) -> int:
-    return render_from_timeline(
-        args.timeline,
-        out=args.out,
-        skip_intermediate=args.skip_intermediate,
-        force=args.force,
-        tts_backend=args.tts_backend,
-        cache_dir=_cache_dir_arg(args),
-        split_tracks=args.split_tracks,
-    )
+def run_produce(args: argparse.Namespace) -> int:
+    """produce 入口:--timeline 读文件产出;否则从文案现建时间线再产出(一键用法)。"""
+    timeline_path = getattr(args, "timeline", None)
+    if timeline_path:
+        if args.text or args.file or args.stdin:
+            raise SystemExit("--timeline 与 --text/--file/--stdin 不能同时使用")
+        # 未给 --out 时产物落在 timeline 旁边(基名=timeline 路径去掉后缀)
+        return produce_from_timeline(
+            timeline_path, base=args.out, force=args.force,
+            tts_backend=args.tts_backend, cache_dir=_cache_dir_arg(args),
+        )
 
-
-def run_legacy(args: argparse.Namespace) -> int:
-    """旧一键用法:plan(realtime) + render 一次完成,中间产物默认保留。"""
     text = _resolve_text(args).strip()
     if not text:
         raise SystemExit("文案为空,退出")
-    base = _base_from_out(args.out)
+    base = _base_from_out(args.out or _DEFAULT_OUT)
     meta = collect_meta(args)
-    cache_dir = _cache_dir_arg(args)
-    tl, timings, _audio_ref = _plan_core(
-        text, base, meta, real=True, materials_path=args.materials,
-        cache_dir=cache_dir,
+    assets = material = bgm = annotations = None
+    if args.materials:
+        assets, material, bgm, annotations = load_materials(args.materials)
+        file_errors = check_material_files(assets)
+        if file_errors:
+            raise SystemExit("素材文件缺失:\n" + "\n".join(file_errors))
+        annotate_crop_frames(assets, material, meta)
+    # 这里的时间线只是"参数容器"(文本/参数/素材),真实轴由 produce 合成后重建
+    meta["timing_mode"] = "estimate"
+    tl = build_timeline(
+        text, meta=meta,
+        assets=assets, material=material, bgm=bgm, annotations=annotations,
     )
-    print(checks_report(tl.checks))
-    return render_from_timeline(
-        f"{base}.timeline.json", out=args.out,
-        skip_intermediate=args.skip_intermediate, force=False, timings=timings,
-        tts_backend=args.tts_backend, cache_dir=cache_dir,
-        split_tracks=args.split_tracks,
+    return produce_timeline(
+        tl, base=base, force=args.force,
+        tts_backend=args.tts_backend, cache_dir=_cache_dir_arg(args),
+        precheck=False,
     )
 
 
@@ -496,15 +457,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_voices()
         return 0
 
+    try:
+        return _dispatch(args)
+    except RuntimeError as exc:
+        # ffmpeg/ffprobe 失败等外部原因:给可读报错,不打 traceback
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
+
+
+def _dispatch(args: argparse.Namespace) -> int:
+    """按子命令分发;无子命令时走一键 produce。"""
     if args.command == "plan":
         return run_plan(args)
-    if args.command == "render":
-        return run_render(args)
+    if args.command == "produce":
+        return run_produce(args)
     if args.command == "cover":
         return run_cover(args)
     if args.command == "doctor":
         return run_doctor(args)
-    return run_legacy(args)
+    return run_produce(args)
 
 
 def _apply_config(args: argparse.Namespace, argv: Sequence[str] | None = None) -> None:
@@ -533,7 +504,7 @@ def _apply_config(args: argparse.Namespace, argv: Sequence[str] | None = None) -
     for action in parser._actions:
         for opt in action.option_strings:
             option_to_dest[opt] = action.dest
-    # 子命令 parser 的参数也在计(如 render 的 --tts-backend / --split-tracks)
+    # 子命令 parser 的参数也在计(如 produce 的 --tts-backend / --force)
     for action in parser._actions:
         if isinstance(action, argparse._SubParsersAction):
             for sub in action.choices.values():
@@ -554,11 +525,11 @@ def _apply_config(args: argparse.Namespace, argv: Sequence[str] | None = None) -
         if key in explicit_keys:
             continue  # 命令行显式指定,配置不覆盖
         if not hasattr(args, key):
-            # 子命令(render/doctor)parser 本身没有的键:仅 debug 提示,不打扰
+            # 子命令(produce/doctor)parser 本身没有的键:仅 debug 提示,不打扰
             LOG.debug("配置文件包含当前命令不支持的参数 %r,忽略", key)
             continue
         current = getattr(args, key)
-        # 当前值为 None(子命令默认,如 render 的 --tts-backend)视为未指定;
+        # 当前值为 None(子命令默认,如 produce 的 --tts-backend)视为未指定;
         # 否则须仍等于顶层默认值才允许配置覆盖(命令行显式 ≠ None/默认 时不覆盖)
         if current is not None and current != defaults.get(key):
             continue  # 已非默认值(如经其他配置键联动),不覆盖

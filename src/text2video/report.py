@@ -1,7 +1,7 @@
 """报告模块:把 Timeline 渲染成两种人类可读产物。
 
 - timeline.md:按轨分节的 Markdown 报告,适合在编辑器里快速通读(只读,
-  改稿请改 timeline.json 或源文本后重新 plan/render,render 会覆盖 md);
+  改稿请改 timeline.json 或源文本后重新 plan/produce,produce 会覆盖 md);
 - preview.html:自包含单文件(零依赖、双击即开)的多轨时间线浏览器:
   多条平行时间轴互相对齐,每条轨道可独立开关(单独查看),可播放 MP3
   (有音频)或虚拟时钟(无音频)同步高亮当前段、显示当前字幕文本。
@@ -268,7 +268,7 @@ function cssColor(c) {
   document.getElementById("meta-panel").innerHTML =
     rows.map(r => "<span>" + esc(r[0]) + ": <b>" + esc(r[1]) + "</b></span>").join("");
   document.getElementById("sub-epoch").textContent =
-    "plan → render 两阶段中间产物 · " + (AUDIO_REF ? "已含音频,可播放审片" :
+    "plan → produce 两阶段中间产物 · " + (AUDIO_REF ? "已含音频,可播放审片" :
       "无音频(估算模式),使用虚拟时钟推进查看布局");
 })();
 

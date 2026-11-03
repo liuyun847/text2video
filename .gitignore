@@ -4,11 +4,14 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+# 本机 %TEMP% 对 uv 子进程不可写时,pytest 会把临时根目录建在项目里
+pytest-of-*/
 
 # 输出与中间产物
 out/
 *.mp4
 *.mp3
+*.webm
 *.ass
 
 # IDE

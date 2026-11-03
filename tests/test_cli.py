@@ -10,27 +10,28 @@ from text2video.cli import (
     resolve_canvas,
     run_plan,
 )
-from text2video.render import render_from_timeline
+from text2video.produce import produce_from_timeline
 from text2video.timeline import Timeline, TrackSegment
 
 
 def test_parser_defaults():
     ns = build_parser().parse_args(["--text", "你好"])
-    # 画幅/帧率默认(本轮调整:1:1 方画幅 + 60fps;width/height 0=按预设解析)
+    # 画幅/帧率默认(1:1 方画幅 + 60fps;width/height 0=按预设解析)
     assert ns.width == 0
     assert ns.height == 0
     assert ns.fps == 60
     assert ns.aspect is None
-    # 字幕/合成默认
+    # 字幕/中间件默认
     assert ns.style == "karaoke"
-    assert ns.out == "output.mp4"
+    assert ns.out == "output"          # 产物基名(不再是 mp4 路径)
     assert ns.bg_color == "1B1B2A"
     assert ns.crf == 23
     assert ns.preset == "medium"
-    # 新增默认:转场关、TTS auto、分离关
+    # 默认:转场关、TTS auto
     assert ns.transition == 0.0
     assert ns.tts_backend == "auto"
-    assert ns.split_tracks is False
+    # 画面整片合成相关参数随 render 一起移除
+    assert not hasattr(ns, "split_tracks")
 
 
 def test_aspect_presets():
@@ -48,16 +49,23 @@ def test_aspect_presets():
     assert resolve_canvas(ns.width, ns.height, ns.aspect) == (1080, 1080)
 
 
-def test_parser_subcommands_plan_and_render():
+def test_parser_subcommands_plan_and_produce():
     p = build_parser()
     plan = p.parse_args(["plan", "--file", "a.txt", "--out", "out/x"])
     assert plan.command == "plan"
     assert plan.file == "a.txt"
     assert plan.out == "out/x"
-    render = p.parse_args(["render", "--timeline", "out/x.timeline.json"])
-    assert render.command == "render"
-    assert render.timeline == "out/x.timeline.json"
-    assert render.out is None  # render 默认由 timeline 基名推导
+    pr = p.parse_args(["produce", "--timeline", "out/x.timeline.json"])
+    assert pr.command == "produce"
+    assert pr.timeline == "out/x.timeline.json"
+    assert pr.out is None              # 缺省由 timeline 基名推导
+    assert pr.force is False
+    # produce 也支持直接从文案现建(一键用法同一套参数)
+    pr2 = p.parse_args(["produce", "--text", "你好", "--out", "out/y", "--force"])
+    assert pr2.text == "你好" and pr2.out == "out/y" and pr2.force is True
+    # 旧 render 子命令已移除
+    with pytest.raises(SystemExit):
+        p.parse_args(["render", "--timeline", "x.timeline.json"])
 
 
 def test_collect_meta_derives_fontsize_maxchars_family():
@@ -144,8 +152,10 @@ def test_run_plan_with_missing_material_file_fails(tmp_path):
         run_plan(ns)
 
 
-def test_render_rejects_bad_timeline(tmp_path):
-    # 手改出非法时间线(语音段 start>end),render 应自检拒绝,不进 TTS/ffmpeg
+def test_produce_rejects_bad_timeline(tmp_path, monkeypatch):
+    # 手改出非法时间线(语音段 start>end),produce 应自检拒绝,不进 TTS/ffmpeg
+    monkeypatch.setattr("text2video.produce.compose.find_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr("text2video.produce.compose.find_ffprobe", lambda f: "ffprobe")
     tl = Timeline(text="你好。", meta={"width": 100, "height": 100})
     tl.tracks["visual"] = []
     tl.tracks["speech"] = [TrackSegment(2.0, 1.0, "你好。")]
@@ -154,7 +164,7 @@ def test_render_rejects_bad_timeline(tmp_path):
     bad = tmp_path / "bad.timeline.json"
     tl.to_json(str(bad))
     with pytest.raises(SystemExit) as exc:
-        render_from_timeline(str(bad))
+        produce_from_timeline(str(bad))
     assert exc.value.code == 2
 
 

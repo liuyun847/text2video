@@ -5,7 +5,7 @@ edge-tts 的 WordBoundary 事件字段:offset/duration 单位是 100ns 的 tick,
 换算成秒 = tick / 10_000_000(与官方 SubMaker 的换算一致)。
 
 缓存:按 (voice, rate, volume, pitch, text) 哈希,命中时跳过联网合成,
-直接复用 mp3 与逐字时间轴(render 二次渲染不重复联网)。
+直接复用 mp3 与逐字时间轴(produce 重跑不重复联网)。
 重试:网络抖动时按指数退避重试,重试耗尽抛最后一次异常。
 """
 

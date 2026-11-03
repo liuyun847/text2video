@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from text2video.render import _probe_material_bounds
+from text2video.produce import plan_materials
 from text2video.timeline import (
     TrackSegment,
     build_timeline,
@@ -163,7 +163,7 @@ def test_validate_materials_adjacent_segments_ok():
     assert errs == []
 
 
-def test_probe_material_bounds_catches_probe_failure(monkeypatch):
+def test_plan_materials_catches_probe_failure(monkeypatch):
     # ffprobe 探测失败(损坏/无视频流)应并入 errors,而非裸抛(与 --force 语义一致)
     from text2video.timeline import Timeline
 
@@ -174,9 +174,9 @@ def test_probe_material_bounds_catches_probe_failure(monkeypatch):
         raise RuntimeError("无视频流或不可解码: 1")
 
     monkeypatch.setattr(
-        "text2video.render.compose.probe_video_duration", boom
+        "text2video.produce.compose.probe_video_duration", boom
     )
-    errs = _probe_material_bounds(tl, "ffprobe")
+    _plans, errs = plan_materials(tl, "ffprobe")
     assert any("时长探测失败" in e and "无视频流" in e for e in errs)
 
 

@@ -1,5 +1,6 @@
 """doctor 模块单测:注入检查项断言状态与汇总;离线默认项格式。"""
 
+from text2video import doctor
 from text2video.doctor import ffmpeg_major_version, run_all_checks
 
 
@@ -31,6 +32,53 @@ def test_run_all_checks_with_injected_items():
 def test_run_all_checks_online_appends_network():
     results = run_all_checks(online=True, checks=[lambda: ("x", "PASS", "")])
     assert results[-1][0] == "edge-tts 网络"
+
+
+def test_vp9_alpha_check_detects_yuva420p(monkeypatch):
+    """透明字幕轨依赖 libvpx-vp9 的 yuva420p;doctor 直接查编码器能力表。"""
+    class _R:
+        returncode = 0
+        stdout = "Supported pixel formats: yuv420p yuva420p"
+        stderr = ""
+
+    monkeypatch.setattr(doctor.compose, "find_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(doctor.subprocess, "run", lambda *a, **k: _R())
+    name, status, detail = doctor._vp9_alpha_check()
+    assert name == "VP9 透明编码" and status == "PASS"
+    assert "yuva420p" in detail
+
+
+def test_vp9_alpha_check_reports_missing_encoder(monkeypatch):
+    class _R:
+        returncode = 1
+        stdout = ""
+        stderr = "Unknown encoder 'libvpx-vp9'"
+
+    monkeypatch.setattr(doctor.compose, "find_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(doctor.subprocess, "run", lambda *a, **k: _R())
+    _name, status, detail = doctor._vp9_alpha_check()
+    assert status == "FAIL" and "libvpx-vp9" in detail
+
+
+def test_vp9_alpha_check_warns_without_yuva420p(monkeypatch):
+    class _R:
+        returncode = 0
+        stdout = "Supported pixel formats: yuv420p yuv422p"
+        stderr = ""
+
+    monkeypatch.setattr(doctor.compose, "find_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(doctor.subprocess, "run", lambda *a, **k: _R())
+    _name, status, _detail = doctor._vp9_alpha_check()
+    assert status == "WARN"
+
+
+def test_vp9_alpha_check_handles_missing_ffmpeg(monkeypatch):
+    def boom():
+        raise RuntimeError("未找到 ffmpeg")
+
+    monkeypatch.setattr(doctor.compose, "find_ffmpeg", boom)
+    _name, status, detail = doctor._vp9_alpha_check()
+    assert status == "FAIL" and "ffmpeg" in detail
 
 
 def test_run_all_checks_default_shape():

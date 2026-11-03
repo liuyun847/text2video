@@ -1,14 +1,16 @@
 """时间线模块:把"语音 / 字幕 / 素材 / 画面"多条轨道按时间对齐,产出一份人类可读、
-可审查、可复现的中间产物(timeline.json)。它是 plan → render 两阶段流程的单一事实源。
+可审查、可复现的中间产物(timeline.json)。它是 plan → produce 流程的单一事实源。
 
 两条时间轴来源:
 - 估算(estimate):离线按字数速率生成逐字轴,无需联网,用于快速排版草稿;
-- 真实(real):来自 edge-tts 的 WordBoundary 逐字时间轴,渲染校验时的最终依据。
+- 真实(real):来自 edge-tts 的 WordBoundary 逐字时间轴,产出中间件时的最终依据。
 
 轨道说明:
-- speech   语音轨:按句子聚合的段落 [{start, end, text}]
-- subtitle 字幕轨:默认与语音同源(显示与朗读一致),保留独立字段以便未来分离
+- speech   语音轨:按句子聚合的段落 [{start, end, text}],data.words 内嵌该句逐字轴(v5 起)
+- subtitle 字幕轨:默认与语音同源(显示与朗读一致),保留独立字段以便未来分离;
+           逐字轴与 speech 逐段同源,不重复落盘(消费端按段序对齐即可)
 - visual   画面轨:场景分段(当前单场景,预留多场景扩展字段)
+- material 素材轨:按段落覆盖视频/图片素材,data 带 in/out、crop、frame
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from itertools import pairwise
 from typing import Any
 
@@ -41,13 +43,50 @@ _DURATION_TOLERANCE = 0.6
 class TrackSegment:
     """一条轨道上的一个时间片段。text 语义取决于所在轨道。
 
-    素材轨(material)额外用 data 携带素材引用:{"asset": id, "in": .., "out": ..}。
+    data 按轨道携带附加信息:
+    - speech:{"words": [{"text", "start", "end"}, ...]} —— 该句逐字轴(v5 起落盘);
+    - material:{"in": .., "out": ..}(视频裁剪)、"crop": {"x","y"}(窗口位置)、
+      "frame": {"x","y","w","h"}(窗口相对素材几何,仅供审片标注)。
     """
 
     start: float
     end: float
     text: str
     data: dict = field(default_factory=dict)
+
+
+def _words_to_list(words: object) -> list[dict]:
+    """把逐字轴规范成 [{"text","start","end"}](时间 round 3);非法输入返回空表。
+
+    逐字轴可能来自 TTS(WordTiming 对象)或手读的 timeline.json(dict),两种都吃。
+    """
+    out: list[dict] = []
+    for w in words or []:
+        if isinstance(w, dict):
+            text, start, end = w.get("text", ""), w.get("start", 0.0), w.get("end", 0.0)
+        else:
+            text, start, end = getattr(w, "text", ""), getattr(w, "start", 0.0), getattr(w, "end", 0.0)
+        out.append({"text": str(text), "start": round(float(start), 3),
+                    "end": round(float(end), 3)})
+    return out
+
+
+def segment_words(seg: TrackSegment) -> list[dict]:
+    """取出一条语音段内嵌的逐字轴 [{"text","start","end"}];无逐字轴(v2/v4 旧档)返回空表。"""
+    return _words_to_list(seg.data.get("words") if isinstance(seg.data, dict) else None)
+
+
+def _segment_to_dict(seg: TrackSegment) -> dict:
+    """段 → JSON dict:时间统一 round 3(秒),数据字段原样(逐字轴另行取整)。"""
+    data = dict(seg.data)
+    if "words" in data:
+        data["words"] = _words_to_list(data["words"])
+    return {
+        "start": round(seg.start, 3),
+        "end": round(seg.end, 3),
+        "text": seg.text,
+        "data": data,
+    }
 
 
 @dataclass
@@ -62,9 +101,11 @@ class Timeline:
     bgm: dict | None = None                            # 背景音乐 {asset, volume}
     annotations: list[dict] = field(default_factory=list)  # 画面标注框 [{start,end,x,y,w,h,color}]
     checks: list[str] = field(default_factory=list)
-    version: int = 4   # v2 起增加 assets/bgm/material 轨;v3 起素材段可带画面裁剪 crop;
+    version: int = 5   # v2 起增加 assets/bgm/material 轨;v3 起素材段可带画面裁剪 crop;
                        # v4 crop 移除 zoom(cover 满幅+单轴滑动),素材段增加窗口几何 frame,
-                       # 时间线增加画面标注框 annotations;旧文件仍可从 from_dict 读入
+                       # 时间线增加画面标注框 annotations;
+                       # v5 语音段 data.words 内嵌逐字轴(Remotion 逐字字幕的唯一前置)。
+                       # 旧 v2/v4 档仍可从 from_dict 读入(v5 只新增字段,不改旧字段语义)
 
     # -- 序列化 --------------------------------------------------------------
     def to_dict(self) -> dict:
@@ -74,7 +115,7 @@ class Timeline:
             "text": self.text,
             "duration": round(self.duration, 3),
             "tracks": {
-                name: [asdict(s) for s in segs]
+                name: [_segment_to_dict(s) for s in segs]
                 for name, segs in self.tracks.items()
             },
             "assets": self.assets,
@@ -161,7 +202,7 @@ def load_materials(path: str) -> tuple[list[dict], list[dict], dict | None, list
 
     相对路径按本文件所在目录解析并转绝对;字段完整性在此校验,
     引用一致性/时长等交给 validate_materials / validate_annotations
-    (plan 与 render 共用)。校验失败抛 ValueError。
+    (plan 与 produce 共用)。校验失败抛 ValueError。
     """
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
@@ -244,7 +285,7 @@ def load_materials(path: str) -> tuple[list[dict], list[dict], dict | None, list
 
 
 def check_material_files(assets: list[dict]) -> list[str]:
-    """素材文件存在性检查(plan/render 共用),返回错误列表。"""
+    """素材文件存在性检查(plan/produce 共用),返回错误列表。"""
     missing = [a["path"] for a in assets if not os.path.isfile(a["path"])]
     return [f"素材文件不存在: {p}" for p in missing]
 
@@ -468,8 +509,11 @@ def build_timeline(
     assets/material/bgm/annotations:素材清单(见 load_materials)。material 段
     dict 格式:{"start","end","asset", 视频另有 "in"/"out", 可选 "crop"/"frame"},
     将转换为素材轨 TrackSegment(text=asset id, data={"in","out",...})。
-    frame 为裁剪窗口相对素材的比例 {"x","y","w","h"},由 plan 阶段探测素材分辨率
-    后写入,供审片在素材图上标注窗口位置(纯展示,渲染仍自行计算像素)。
+    frame 为裁剪窗口相对素材的比例 {"x","y","w","h"},由探测素材分辨率后写入,
+    供审片标注窗口位置(纯展示,切素材时另行按像素计算)。
+
+    逐字轴随句落盘(speech 段 data.words):Remotion 侧逐字点亮字幕只认这份数据,
+    不再需要宿主重新合成语音。
     """
     text = text.strip()
     if not text:
@@ -493,7 +537,9 @@ def build_timeline(
             start, end = toks[0].start, toks[-1].end
         else:
             start = end = 0.0
-        speech.append(TrackSegment(start, end, sent))
+        # 逐字轴随句落盘(v5):只有 speech 段带,subtitle 逐段同源不重复存
+        words = _words_to_list(toks)
+        speech.append(TrackSegment(start, end, sent, data={"words": words} if words else {}))
         subtitle.append(TrackSegment(start, end, sent))
 
     if duration is None:
@@ -564,6 +610,41 @@ def validate_annotations(annotations: list[dict]) -> list[str]:
     return errors
 
 
+# 逐字轴与本句区间允许的偏差(落盘 round 3 的取整误差量级)
+_WORDS_TOLERANCE = 0.02
+
+
+def validate_words(speech: list[TrackSegment]) -> list[str]:
+    """逐字轴自检:单调递增、首字不早于段首、末字不晚于段末;返回错误列表。
+
+    v2/v4 旧档没有逐字轴(空),一律跳过 —— 只有带 words 的段才校验。
+    """
+    errors: list[str] = []
+    for i, seg in enumerate(speech):
+        words = segment_words(seg)
+        if not words:
+            continue
+        prev_start = -1.0
+        for j, w in enumerate(words):
+            if w["end"] < w["start"]:
+                errors.append(
+                    f"语音段 {i} 第 {j} 个逐字轴时间非法"
+                    f"({w['start']:g} > {w['end']:g})"
+                )
+            if w["start"] < prev_start - _WORDS_TOLERANCE:
+                errors.append(f"语音段 {i} 第 {j} 个逐字轴起点倒退({w['start']:g}s)")
+            prev_start = w["start"]
+        if words[0]["start"] < seg.start - _WORDS_TOLERANCE:
+            errors.append(
+                f"语音段 {i} 首字 {words[0]['start']:g}s 早于段首 {seg.start:g}s"
+            )
+        if words[-1]["end"] > seg.end + _WORDS_TOLERANCE:
+            errors.append(
+                f"语音段 {i} 末字 {words[-1]['end']:g}s 晚于段末 {seg.end:g}s"
+            )
+    return errors
+
+
 def validate_timeline(tl: Timeline) -> list[str]:
     """对时间线做一致性自检,返回错误消息列表;为空表示全部通过。"""
     errors: list[str] = []
@@ -604,6 +685,9 @@ def validate_timeline(tl: Timeline) -> list[str]:
         for i, (a, b) in enumerate(zip(speech, subtitle)):
             if a.text.strip() != b.text.strip():
                 errors.append(f"第 {i} 段语音与字幕文本不一致: {a.text!r} vs {b.text!r}")
+
+    # 逐字轴自检(v5):有则必须落在本句区间内且单调递增,否则字幕逐字点亮会错位
+    errors += validate_words(speech)
 
     # 语音末端与总时长对齐(TTS 尾部有 padding,允许容差)
     if abs(speech[-1].end - tl.duration) > _DURATION_TOLERANCE:

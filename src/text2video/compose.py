@@ -1,7 +1,12 @@
-"""合成模块:定位 ffmpeg/ffprobe,生成并执行"背景 + 字幕 + 语音"的合成命令。
+"""媒体中间件模块:定位 ffmpeg/ffprobe、探测媒体信息、生产交给 Remotion 的素材中间件。
 
-背景默认为纯色(可换背景图),字幕用过滤器的 subtitles=xxx.ass 渲染(libass),
-辅助字体复制到工作目录后通过 fontsdir=. 指定,避免 Windows 路径冒号转义问题。
+定位变化(本模块不再做整片画面合成):
+- 保留:可执行文件定位、ffprobe 探测(时长/尺寸/透明标记)、BGM 混音、音频转 mp3;
+- 新增:透明字幕轨(ASS 烧到 alpha 画布 → VP9/yuva420p)、素材段裁切(裁到输出画幅);
+- 移除:整片画面合成命令(build_video_cmd)、音画分离(split_tracks)。
+
+所有命令在输出目录内执行(cwd=输出目录),故音频/字幕/字体一律用相对名,
+避免 Windows 盘符冒号在 ffmpeg 滤镜参数里的转义问题。
 """
 
 from __future__ import annotations
@@ -70,31 +75,35 @@ def find_ffprobe(ffmpeg: str) -> str:
     found = shutil.which("ffprobe")
     if found:
         return found
-    raise RuntimeError("未找到 ffprobe,无法读取音频时长")
+    raise RuntimeError("未找到 ffprobe,无法读取媒体时长与尺寸")
 
 
 # ---------------------------------------------------------------------------
-# 辅助
+# 探测
 # ---------------------------------------------------------------------------
 
-def probe_duration(ffprobe: str, audio: str) -> float:
-    """用 ffprobe 读取音频时长(秒)。"""
-    cmd = [
-        ffprobe, "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        audio,
-    ]
+def _ffprobe_lines(ffprobe: str, args: Sequence[str], path: str) -> list[str]:
+    """执行一次 ffprobe 并返回去空行后的 stdout;失败抛 RuntimeError(带 stderr)。"""
+    cmd = [ffprobe, "-v", "error", *args, path]
     out = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8",
         errors="replace", check=False,
     )
     if out.returncode != 0:
-        raise RuntimeError(f"ffprobe 读取时长失败: {out.stderr.strip()}")
+        raise RuntimeError(f"ffprobe 读取失败: {out.stderr.strip() or '无输出'}")
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
+def probe_duration(ffprobe: str, audio: str) -> float:
+    """用 ffprobe 读取媒体时长(秒)。"""
+    lines = _ffprobe_lines(
+        ffprobe, ["-show_entries", "format=duration",
+                  "-of", "default=noprint_wrappers=1:nokey=1"], audio,
+    )
     try:
-        return float(out.stdout.strip())
-    except ValueError:
-        raise RuntimeError(f"无法解析音频时长: {out.stdout.strip()!r}")
+        return float(lines[-1])
+    except (IndexError, ValueError):
+        raise RuntimeError(f"无法解析媒体时长: {lines!r}")
 
 
 def probe_video_duration(ffprobe: str, path: str) -> float:
@@ -103,23 +112,14 @@ def probe_video_duration(ffprobe: str, path: str) -> float:
     用视频流时长而非 format 时长:容器 format 时长可能含尾部 padding,
     素材裁剪(in/out)边界校验以视频流实际时长为准更可靠。
     """
-    cmd = [
-        ffprobe, "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path,
-    ]
-    out = subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8",
-        errors="replace", check=False,
+    lines = _ffprobe_lines(
+        ffprobe, ["-select_streams", "v:0", "-show_entries", "stream=duration",
+                  "-of", "default=noprint_wrappers=1:nokey=1"], path,
     )
-    if out.returncode != 0 or not out.stdout.strip():
-        raise RuntimeError(f"无视频流或不可解码: {out.stderr.strip() or '无输出'}")
     try:
-        return float(out.stdout.strip().splitlines()[-1].strip())
-    except ValueError:
-        raise RuntimeError(f"无法解析视频时长: {out.stdout.strip()!r}")
+        return float(lines[-1])
+    except (IndexError, ValueError):
+        raise RuntimeError(f"无法解析视频时长: {lines!r}")
 
 
 def probe_dimensions(ffprobe: str, path: str) -> tuple[int, int]:
@@ -127,21 +127,12 @@ def probe_dimensions(ffprobe: str, path: str) -> tuple[int, int]:
 
     用于画面裁剪:素材带 crop 时按原始分辨率计算裁剪窗口像素。
     """
-    cmd = [
-        ffprobe, "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height",
-        "-of", "default=noprint_wrappers=1",
-        path,
-    ]
-    out = subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8",
-        errors="replace", check=False,
+    lines = _ffprobe_lines(
+        ffprobe, ["-select_streams", "v:0", "-show_entries", "stream=width,height",
+                  "-of", "default=noprint_wrappers=1"], path,
     )
-    if out.returncode != 0 or not out.stdout.strip():
-        raise RuntimeError(f"无视频流或不可解码: {out.stderr.strip() or '无输出'}")
     dims: dict[str, int] = {}
-    for line in out.stdout.splitlines():
+    for line in lines:
         key, _, val = line.partition("=")
         if key in ("width", "height"):
             try:
@@ -150,11 +141,24 @@ def probe_dimensions(ffprobe: str, path: str) -> tuple[int, int]:
                 raise RuntimeError(f"无法解析素材尺寸: {line!r}")
     if dims.get("width") and dims.get("height"):
         return dims["width"], dims["height"]
-    raise RuntimeError(f"未读到完整尺寸: {out.stdout.strip()!r}")
+    raise RuntimeError(f"未读到完整尺寸: {lines!r}")
+
+
+def probe_alpha_mode(ffprobe: str, path: str) -> str | None:
+    """读取 WebM 的 alpha_mode 标记(有透明通道时为 "1",否则 None)。
+
+    VP9/WebM 的 alpha 不占主画面 pix_fmt(ffprobe 仍报 yuv420p),而是另存一条
+    alpha 平面并用容器级 alpha_mode 标记;因此"是否真的带透明"只能看这个标记。
+    """
+    lines = _ffprobe_lines(
+        ffprobe, ["-select_streams", "v:0", "-show_entries", "stream_tags=alpha_mode",
+                  "-of", "default=noprint_wrappers=1:nokey=1"], path,
+    )
+    return lines[-1] if lines else None
 
 
 def pick_system_font() -> str | None:
-    """挑一个含中文的字体文件,复制到工作目录供 libass 使用。"""
+    """挑一个含中文的字体文件(供 libass 渲染 ASS 字幕)。"""
     candidates = (
         r"C:\Windows\Fonts\msyh.ttc",      # 微软雅黑
         r"C:\Windows\Fonts\msyh.ttf",
@@ -174,146 +178,96 @@ def pick_system_font() -> str | None:
 # 命令构建 / 执行
 # ---------------------------------------------------------------------------
 
-def build_video_cmd(
+def build_subtitle_track_cmd(
     ffmpeg: str,
     *,
-    audio: str,          # 工作目录内的相对名
-    ass: str,            # 工作目录内的相对名
+    ass: str,                  # 输出目录内的相对名(避免 Windows 路径冒号转义)
     out: str,
     width: int,
     height: int,
     fps: int,
-    bg_color: str,       # 09BgHex,如 "1B1B2A"
-    bg_image: str | None,
     duration: float,
-    materials: Sequence[dict] = (),
-    transition: float = 0.0,
-    crf: int = 23,
-    preset: str = "medium",
-    audio_bitrate: str = "192k",
-    annotations: Sequence[dict] = (),
+    fontsdir: str | None = None,
+    crf: int = 30,
 ) -> list[str]:
-    """组装 ffmpeg 命令(在输出目录内执行,故音频/字幕用相对名)。
+    """组装"ASS 烧到透明画布 → 透明字幕轨(WebM)"命令。
 
-    materials:素材段列表,每项须含 {"path", "type": video|image, "start", "end",
-    视频另含 "in"/"out"(素材内裁剪,秒)}。素材按段落全屏覆盖(overlay 铺满),
-    未覆盖区间保持 bg_color/bg_image 背景;素材自带音频一律忽略。
-    素材项可选带 "crop": {"w","h","x","y"}(像素裁剪窗口,由渲染端按素材分辨率
-    与画幅比例、crop(x/y)算出),此时滤镜为 crop=cw:ch:cx:cy,scale 不变形放大;
-    缺省则沿用等比铺满+中心裁剪。
-    annotations:画面标注框列表,每项 {"start","end"(秒), "x","y","w","h"(画幅比例),
-    "color"(0xRRGGBB,默认红色)};以 6px 矩形框(drawbox)叠加在**字幕之下、素材之上**
-    的层级,只在该时段可见。
-    transition:素材段淡入/淡出时长(秒,每段内部钳制到段长一半;0=硬切)。
+    透明底三步缺一不可(实测:少任何一步 alpha 恒为 255,叠到背景上就是黑块):
+    1. 画布色块用 color=c=black 生成,再 format=rgba 带上 alpha 通道;
+    2. colorchannelmixer=aa=0 把整幅 alpha 显式压成 0(不依赖色源的 @0 语义);
+    3. subtitles/ass 滤镜必须写 alpha=1(默认 false,不处理 alpha 通道)。
+    编码用 VP9 + pix_fmt=yuva420p;auto-alt-ref=0 是 libvpx-vp9 保留 alpha 平面的
+    必要条件,row-mt 加速。帧数用 -frames:v 锁死(= round(duration*fps)),与
+    render.json 的 durationInFrames 一致,避免 -t 的帧取整让消费端少一帧。
+    fontsdir 为输出目录内的相对子目录名(字体文件独占该目录,避免把其他文件当字体)。
     """
-    args = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
-    fc: list[str] = []
-    # ---- 背景输入(流 0)----
-    if bg_image:
-        args += ["-loop", "1", "-framerate", str(fps), "-i", bg_image]
-        fc.append(
-            f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height}[bg]"
-        )
-        prev = "[bg]"
-    else:
-        args += [
-            "-f", "lavfi",
-            "-i", f"color=c={bg_color}:s={width}x{height}:r={fps}",
-        ]
-        prev = "[0:v]"
-    # ---- 素材输入(流 1..N;图片需要 -loop 撑住 overlay 窗口)----
-    for m in materials:
-        if m["type"] == "image":
-            args += ["-loop", "1", "-framerate", str(fps), "-i", m["path"]]
-        else:
-            args += ["-i", m["path"]]
-    args += ["-i", audio]   # 流 N+1:配音(可能已含 BGM 预混)
-    # ---- filter_complex:素材裁剪/铺满 → 按时间窗口 overlay 到主画面 ----
-    for i, m in enumerate(materials, start=1):
-        seg_len = max(0.0, m["end"] - m["start"])
-        fade = min(transition, seg_len / 2) if transition > 0 else 0.0
-        chain = f"[{i}:v]"
-        video_clip = m["type"] == "video"
-        if video_clip:
-            chain += f"trim=start={m['in']:.3f}:end={m['out']:.3f},setpts=PTS-STARTPTS,"
-        if fade > 0:
-            # alpha 淡入/淡出:视频段在 trim 后为段内时间;图片段为全局时间
-            fin_st = 0.0 if video_clip else m["start"]
-            fout_st = (seg_len - fade) if video_clip else (m["end"] - fade)
-            chain += (
-                f"format=rgba,fade=t=in:st={fin_st:.3f}:d={fade:.3f}:alpha=1,"
-                f"fade=t=out:st={max(fout_st, fin_st):.3f}:d={fade:.3f}:alpha=1,"
-            )
-        crop_px = m.get("crop")
-        if crop_px:
-            # 画面裁剪:窗口比例已=输出画幅,直接放大铺满(不变形、不二次裁切)
-            chain += (
-                f"crop={crop_px['w']}:{crop_px['h']}:{crop_px['x']}:{crop_px['y']},"
-                f"scale={width}:{height}[m{i}]"
-            )
-        else:
-            chain += (
-                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height}[m{i}]"
-            )
-        fc.append(chain)
-        label = f"[v{i}]"
-        fc.append(
-            f"{prev}[m{i}]overlay=0:0:enable='between(t,{m['start']:.3f},{m['end']:.3f})'"
-            f"{label}"
-        )
-        prev = label
-    if annotations:
-        # 有标注框:先逐个叠加 drawbox(最后一个输出 [vsub]),再渲染字幕 → 框在字幕下层。
-        # 注意:filtergraph 中"纯标签转发"(如 [x][y])非法,故不能先标 [annN] 再转发
-        n_ann = len(annotations)
-        for i, ann in enumerate(annotations):
-            try:
-                ax = int(float(ann["x"]) * width)
-                ay = int(float(ann["y"]) * height)
-                aw = int(float(ann["w"]) * width)
-                ah = int(float(ann["h"]) * height)
-                a_start = float(ann["start"])
-                a_end = float(ann["end"])
-            except (KeyError, ValueError, TypeError):
-                LOG.warning("标注框 %d 参数非法,已跳过(自检应已拦截)", i)
-                continue
-            color = str(ann.get("color", "0xFF3B30"))
-            nxt = "[vsub]" if i == n_ann - 1 else f"[ann{i}]"
-            fc.append(
-                f"{prev}drawbox=x={ax}:y={ay}:w={aw}:h={ah}:color={color}:t=6:"
-                f"enable='between(t,{a_start:.3f},{a_end:.3f})'{nxt}"
-            )
-            prev = nxt
-        # 全部标注被跳过时 prev 仍是素材链末标签,直接接字幕滤镜同样合法
-        fc.append(f"{prev}subtitles={ass}:fontsdir=.[vout]")
-    else:
-        fc.append(f"{prev}subtitles={ass}:fontsdir=.[vout]")
-    args += [
-        "-filter_complex", ";".join(fc),
-        "-map", "[vout]", "-map", f"{1 + len(materials)}:a:0",
-        "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", audio_bitrate,
-        "-movflags", "+faststart",
-        "-t", f"{duration:.3f}",
+    canvas = f"color=c=black:s={width}x{height}:r={fps}:d={duration:.3f}"
+    sub = f"format=rgba,colorchannelmixer=aa=0,subtitles={ass}:alpha=1"
+    if fontsdir:
+        sub = (f"format=rgba,colorchannelmixer=aa=0,"
+               f"subtitles={ass}:fontsdir={fontsdir}:alpha=1")
+    return [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", canvas,
+        "-vf", sub,
+        "-frames:v", str(max(1, round(duration * fps))),
+        "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
+        "-auto-alt-ref", "0", "-b:v", "0", "-crf", str(crf),
+        "-row-mt", "1", "-cpu-used", "4",
         out,
     ]
-    return args
 
 
-def split_tracks(ffmpeg: str, src: str, video_out: str) -> None:
-    """从合成好的 mp4 抽离纯画面流(流拷贝,秒级,无重编码)。
+def build_material_cmd(
+    ffmpeg: str,
+    *,
+    src: str,
+    out: str,
+    kind: str,                 # video | image
+    width: int,
+    height: int,
+    fps: int,
+    in_point: float | None = None,
+    out_point: float | None = None,
+    crop: dict | None = None,  # 像素裁剪窗口 {"w","h","x","y"}(已按画幅比例算好)
+    crf: int = 23,
+    preset: str = "medium",
+) -> list[str]:
+    """组装素材中间件裁切命令:裁成"输出画幅 + 输出 fps"的独立素材。
 
-    src:主输出 mp4;video_out:纯画面无音轨文件路径。
-    音频分离由调用方直接复制工作目录中的配音/mix 文件实现(零编码)。
+    - video:trim(in/out) → 裁窗/铺满 → scale → fps,输出 h264 **无音轨** mp4;
+    - image:裁窗/铺满 → scale,输出单帧 png(用 -update 1 覆盖同名文件)。
+
+    crop 给出时窗口比例恒等于画幅(cover 满幅窗口),直接 scale 到画幅即不变形;
+    缺省时按"等比放大到贴满 + 中心裁切"处理(与旧渲染语义一致)。
     """
-    run_ffmpeg(
-        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-         "-i", src, "-an", "-c", "copy", video_out],
-        cwd=os.path.dirname(os.path.abspath(video_out)) or ".",
-    )
+    chain: list[str] = []
+    if kind == "video":
+        if in_point is None or out_point is None:
+            raise ValueError("视频素材必须给出 in_point/out_point")
+        chain.append(f"trim=start={in_point:.3f}:end={out_point:.3f}")
+        chain.append("setpts=PTS-STARTPTS")
+    if crop:
+        chain.append(f"crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}")
+        chain.append(f"scale={width}:{height}")
+    else:
+        chain.append(f"scale={width}:{height}:force_original_aspect_ratio=increase")
+        chain.append(f"crop={width}:{height}")
+    chain.append("setsar=1")
+    if kind == "image":
+        return [
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", src, "-vf", ",".join(chain),
+            "-frames:v", "1", "-update", "1", out,
+        ]
+    chain.append(f"fps={fps}")
+    return [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", src, "-vf", ",".join(chain),
+        "-an", "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        out,
+    ]
 
 
 def mix_bgm(
@@ -324,8 +278,9 @@ def mix_bgm(
     volume: float,
     duration: float,
     out: str,
+    bitrate: str = "192k",
 ) -> None:
-    """把 BGM 低音量混进配音 mp3(预混方案,主合成命令音频部分保持简单)。
+    """把 BGM 低音量混进配音(预混方案:最终音轨就是混好的 mp3)。
 
     BGM 裁剪到 duration(不足则 apad 静音补齐),降低音量后与配音 amix;
     normalize=0 保证配音不被音量归一化削掉(需 ffmpeg >= 6.1)。
@@ -337,14 +292,23 @@ def mix_bgm(
         (f"[1:a]atrim=0:{duration:.3f},asetpts=N/SR/TB,volume={volume:g},apad[bg];"
          f"[0:a][bg]amix=inputs=2:duration=first:normalize=0[aout]"),
         "-map", "[aout]",
-        "-c:a", "libmp3lame", "-b:a", "192k",
+        "-c:a", "libmp3lame", "-b:a", bitrate,
         out,
     ]
     run_ffmpeg(cmd, cwd=os.path.dirname(os.path.abspath(out)))
 
 
+def transcode_audio(ffmpeg: str, src: str, out: str, *, bitrate: str = "192k") -> None:
+    """把任意音频(SAPI 的 WAV 等)转成 mp3,保证最终音轨统一为 mp3 容器。"""
+    run_ffmpeg(
+        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+         "-i", src, "-vn", "-c:a", "libmp3lame", "-b:a", bitrate, out],
+        cwd=os.path.dirname(os.path.abspath(out)),
+    )
+
+
 def run_ffmpeg(cmd: Sequence[str], *, cwd: str) -> None:
-    """执行 ffmpeg 命令。"""
+    """执行 ffmpeg 命令(cwd=产物目录,命令内用相对名)。"""
     LOG.info("ffmpeg 命令:\n  %s", " ".join(cmd))
     proc = subprocess.run(
         cmd, cwd=cwd, capture_output=True, text=True,
@@ -352,15 +316,7 @@ def run_ffmpeg(cmd: Sequence[str], *, cwd: str) -> None:
     )
     if proc.returncode != 0:
         raise RuntimeError(
-            f"ffmpeg 合成失败(exit={proc.returncode})\n{proc.stderr.strip()}"
+            f"ffmpeg 执行失败(exit={proc.returncode})\n{proc.stderr.strip()}"
         )
     if proc.stderr.strip():
         LOG.debug("ffmpeg stderr: %s", proc.stderr.strip())
-
-
-def prepare_workdir(out: str) -> tuple[str, str, str]:
-    """确定输出目录,并给出音频/字幕的相对名(-i 使用的工作目录内名字)。"""
-    out_dir = os.path.dirname(os.path.abspath(out)) or "."
-    stem = os.path.splitext(os.path.basename(out))[0]
-    os.makedirs(out_dir, exist_ok=True)
-    return out_dir, f"{stem}.mp3", f"{stem}.ass"

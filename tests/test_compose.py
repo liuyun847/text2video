@@ -1,166 +1,205 @@
-"""compose 模块单测:合成命令构建(filter_complex 素材段)与 BGM 预混命令。"""
+"""compose 模块单测:透明字幕轨命令、素材裁切命令、音频混音/转码命令、探测。
 
-from text2video.compose import build_video_cmd, mix_bgm
+画面整片合成(build_video_cmd)已随"画面交给 Remotion"删除,这里只锁中间件命令。
+"""
+
+import pytest
+
+from text2video import compose
+from text2video.compose import (
+    build_material_cmd,
+    build_subtitle_track_cmd,
+    mix_bgm,
+    transcode_audio,
+)
+
+# ---------------------------------------------------------------------------
+# 透明字幕轨:ASS 烧到 alpha 画布 → VP9 / yuva420p
+# ---------------------------------------------------------------------------
 
 
-def _cmd(**kw):
+def _subs_cmd(**kw):
     base = {
-        "audio": "s.mp3", "ass": "s.ass", "out": "s.mp4",
-        "width": 1080, "height": 1080, "fps": 60,
-        "bg_color": "1B1B2A", "bg_image": None, "duration": 10.0,
+        "ass": "demo.ass", "out": "demo.subs.webm",
+        "width": 1080, "height": 1080, "fps": 60, "duration": 12.5,
     }
     base.update(kw)
-    return build_video_cmd("ffmpeg", **base)
+    return build_subtitle_track_cmd("ffmpeg", **base)
 
 
-def test_plain_command_equivalence():
-    """无素材时命令与旧行为等价:单背景输入 + 字幕滤镜 + 音频 map。"""
-    cmd = _cmd()
-    inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
-    assert inputs == ["color=c=1B1B2A:s=1080x1080:r=60", "s.mp3"]
-    fc = cmd[cmd.index("-filter_complex") + 1]
-    assert fc == "[0:v]subtitles=s.ass:fontsdir=.[vout]"
-    i_map = cmd.index("-map")
-    assert cmd[i_map + 1] == "[vout]"
-    assert cmd[i_map + 3] == "1:a:0"      # 音频输入编号 = 1 + 素材数(0 素材)
+def test_subtitle_track_canvas_and_alpha_chain():
+    """透明底三步缺一不可:rgba 画布 + colorchannelmixer=aa=0 + 字幕滤镜 alpha=1。"""
+    cmd = _subs_cmd()
+    canvas = cmd[cmd.index("-i") + 1]
+    assert canvas == "color=c=black:s=1080x1080:r=60:d=12.500"
+    vf = cmd[cmd.index("-vf") + 1]
+    assert vf == ("format=rgba,colorchannelmixer=aa=0,"
+                  "subtitles=demo.ass:alpha=1")
+    assert cmd[0] == "ffmpeg" and "-y" in cmd
 
 
-def test_materials_construct_filter_complex():
-    """两个素材段(视频+图片):overlay 窗口 + trim 裁剪 + map 编号推进。"""
-    cmd = _cmd(materials=[
-        {"path": "c:\\clips\\a.mp4", "type": "video", "start": 0.0, "end": 4.0,
-         "in": 10.0, "out": 14.0},
-        {"path": "c:\\shots\\b.png", "type": "image", "start": 4.0, "end": 10.0},
-    ])
-    start = cmd.index("-filter_complex")
-    fc = ";".join(cmd[start + 1:start + 2])  # 单段 filter_complex 参数
-    inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
-    assert inputs == [
-        "color=c=1B1B2A:s=1080x1080:r=60",     # 纯色背景(lavfi)
-        "c:\\clips\\a.mp4", "c:\\shots\\b.png", "s.mp3",
-    ]
-    # 视频素材:trim + setpts + 铺满
-    assert "trim=start=10.000:end=14.000,setpts=PTS-STARTPTS" in fc
-    assert "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080[m1]" in fc
-    # 图片素材:不 trim,直接铺满
-    assert "crop=1080:1080[m2]" in fc
-    assert "overlay=0:0:enable='between(t,0.000,4.000)'[v1]" in fc
-    assert "overlay=0:0:enable='between(t,4.000,10.000)'[v2]" in fc
-    assert "[v2]subtitles=s.ass:fontsdir=.[vout]" in fc
-    i_map = cmd.index("-map")
-    assert cmd[i_map + 3] == "3:a:0"      # 2 素材 → 音频输入流 3
+def test_subtitle_track_frame_count_locked():
+    cmd = _subs_cmd()
+    # 帧数锁死 = round(duration*fps),与 render.json 的 durationInFrames 对齐
+    assert cmd[cmd.index("-frames:v") + 1] == "750"        # round(12.5 * 60)
+    assert "-t" not in cmd
 
 
-def test_materials_with_bg_image_keeps_chain():
-    """背景图 + 素材:背景先缩放裁切,素材 overlay 在其后。"""
-    cmd = _cmd(bg_image="c:\\bg.jpg", materials=[
-        {"path": "c:\\clips\\a.mp4", "type": "video", "start": 0.0, "end": 3.0,
-         "in": 0.0, "out": 3.0},
-    ])
-    fc = ";".join(cmd)
-    assert "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080[bg]" in fc
-    assert "[bg][m1]overlay=0:0:enable='between(t,0.000,3.000)'[v1]" in fc
-    assert "[v1]subtitles=s.ass:fontsdir=.[vout]" in fc
+def test_subtitle_track_encodes_vp9_yuva420p():
+    cmd = _subs_cmd(crf=28)
+    assert cmd[cmd.index("-c:v") + 1] == "libvpx-vp9"
+    assert cmd[cmd.index("-pix_fmt") + 1] == "yuva420p"
+    # libvpx-vp9 保留 alpha 平面的必要条件
+    assert cmd[cmd.index("-auto-alt-ref") + 1] == "0"
+    assert cmd[cmd.index("-crf") + 1] == "28"
+    assert cmd[cmd.index("-b:v") + 1] == "0"
+    assert cmd[-1] == "demo.subs.webm"
 
 
-def test_materials_with_crop_emits_crop_scale():
-    """素材带像素 crop 时滤镜为 crop=cw:ch:cx:cy,scale=WxH(不变形铺满)。"""
-    cmd = _cmd(materials=[
-        {"path": "c:\\clips\\a.mp4", "type": "video", "start": 0.0, "end": 4.0,
-         "in": 10.0, "out": 14.0, "crop": {"w": 540, "h": 540, "x": 420, "y": 0}},
-    ])
-    fc = ";".join(cmd)
-    # 时间裁剪(trim)仍存在,crop 与其正交
-    assert "trim=start=10.000:end=14.000,setpts=PTS-STARTPTS" in fc
-    # 空间裁剪替换为 crop=...:scale
-    assert "crop=540:540:420:0,scale=1080:1080[m1]" in fc
-    assert "force_original_aspect_ratio=increase" not in fc
-    assert "overlay=0:0:enable='between(t,0.000,4.000)'[v1]" in fc
+def test_subtitle_track_fontsdir_relative():
+    """字体目录用相对名(输出目录内),规避 Windows 盘符冒号在滤镜里的转义问题。"""
+    cmd = _subs_cmd(fontsdir="demo.fonts")
+    vf = cmd[cmd.index("-vf") + 1]
+    assert vf == ("format=rgba,colorchannelmixer=aa=0,"
+                  "subtitles=demo.ass:fontsdir=demo.fonts:alpha=1")
 
 
-def test_materials_without_crop_keeps_previous_behavior():
-    """无 crop 素材仍走等比铺满+中心裁切(回归保护)。"""
-    cmd = _cmd(materials=[
-        {"path": "c:\\shots\\b.png", "type": "image", "start": 0.0, "end": 4.0},
-    ])
-    fc = ";".join(cmd)
-    assert "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080[m1]" in fc
+# ---------------------------------------------------------------------------
+# 素材中间件:裁到输出画幅,视频无音轨
+# ---------------------------------------------------------------------------
 
 
-def test_annotations_emit_drawbox_chain():
-    """有标注框时:先 drawbox(最后一个输出 [vsub])→ 再渲染字幕 → 框在字幕下层。"""
-    cmd = _cmd(annotations=[
-        {"start": 1.0, "end": 3.0, "x": 0.1, "y": 0.2, "w": 0.5, "h": 0.3,
-         "color": "0xFF3B30"},
-    ])
-    fc = ";".join(cmd)
-    # 1080x1080 画幅:0.1*1080=108,0.2*1080=216,0.5*1080=540,0.3*1080=324
-    assert ("drawbox=x=108:y=216:w=540:h=324:color=0xFF3B30:t=6:"
-            "enable='between(t,1.000,3.000)'[vsub]" in fc)
-    assert "[vsub]subtitles=s.ass:fontsdir=.[vout]" in fc
-    # 框先于字幕:fc 中 drawbox 出现在 subtitles 之前
-    assert fc.index("drawbox") < fc.index("subtitles")
+def test_material_cmd_image_with_crop():
+    cmd = build_material_cmd(
+        "ffmpeg", src=r"C:\shots\a.png", out="m00_a.png", kind="image",
+        width=1920, height=1080, fps=60,
+        crop={"w": 1000, "h": 562, "x": 120, "y": 0},
+    )
+    vf = cmd[cmd.index("-vf") + 1]
+    # 裁窗比例=画幅比例 → 直接 scale 到画幅(不变形、不二次裁切)
+    assert vf == "crop=1000:562:120:0,scale=1920:1080,setsar=1"
+    assert cmd[cmd.index("-frames:v") + 1] == "1"
+    assert cmd[cmd.index("-update") + 1] == "1"
+    assert cmd[-1] == "m00_a.png"
+    assert "-an" not in cmd
 
 
-def test_annotations_multiple_chain():
-    """多个标注框:中间框输出中间标签,最后一个输出 [vsub] 再接字幕;无纯标签对。"""
-    cmd = _cmd(annotations=[
-        {"start": 0.0, "end": 1.0, "x": 0.0, "y": 0.0, "w": 0.2, "h": 0.2},
-        {"start": 1.0, "end": 2.0, "x": 0.3, "y": 0.3, "w": 0.2, "h": 0.2},
-    ])
-    fc = ";".join(cmd)
-    assert "drawbox=x=0:y=0:w=216:h=216:color=0xFF3B30:t=6:enable='between(t,0.000,1.000)'[ann0]" in fc
-    assert "[ann0]drawbox=x=324:y=324:w=216:h=216:color=0xFF3B30:t=6:enable='between(t,1.000,2.000)'[vsub]" in fc
-    assert "[vsub]subtitles=s.ass:fontsdir=.[vout]" in fc
-    assert "null" not in fc
+def test_material_cmd_image_without_crop_covers_canvas():
+    cmd = build_material_cmd(
+        "ffmpeg", src=r"C:\shots\a.png", out="m00_a.png", kind="image",
+        width=1080, height=1080, fps=60,
+    )
+    vf = cmd[cmd.index("-vf") + 1]
+    assert vf == (
+        "scale=1080:1080:force_original_aspect_ratio=increase,"
+        "crop=1080:1080,setsar=1"
+    )
 
 
-def test_annotations_default_color():
-    """标注框缺省颜色 = 红色;无标注时输出链路与旧版一致(回归)。"""
-    cmd = _cmd(annotations=[{"start": 0.0, "end": 1.0,
-                             "x": 0.0, "y": 0.0, "w": 0.1, "h": 0.1}])
-    fc = ";".join(cmd)
-    assert "drawbox=x=0:y=0:w=108:h=108:color=0xFF3B30" in fc
-    cmd2 = _cmd()
-    fc2 = ";".join(cmd2)
-    assert "subtitles=s.ass:fontsdir=.[vout]" in fc2
-    assert "drawbox" not in fc2
+def test_material_cmd_video_trims_and_drops_audio():
+    cmd = build_material_cmd(
+        "ffmpeg", src=r"C:\clips\a.mp4", out="m01_a.mp4", kind="video",
+        width=1080, height=1080, fps=30,
+        in_point=10.0, out_point=13.2,
+        crop={"w": 1080, "h": 1080, "x": 420, "y": 0},
+        crf=20, preset="slow",
+    )
+    vf = cmd[cmd.index("-vf") + 1]
+    assert vf == (
+        "trim=start=10.000:end=13.200,setpts=PTS-STARTPTS,"
+        "crop=1080:1080:420:0,scale=1080:1080,setsar=1,fps=30"
+    )
+    # 素材自有音轨一律丢弃
+    assert "-an" in cmd
+    assert cmd[cmd.index("-c:v") + 1] == "libx264"
+    assert cmd[cmd.index("-crf") + 1] == "20"
+    assert cmd[cmd.index("-preset") + 1] == "slow"
+    assert cmd[cmd.index("-pix_fmt") + 1] == "yuv420p"
+    assert cmd[-1] == "m01_a.mp4"
 
 
-def test_annotations_all_invalid_skipped():
-    """全部标注参数非法被跳过(手改/--force 场景防御):无 drawbox,
-    素材链末标签直接接字幕滤镜合法收尾,不产生纯标签对/null。"""
-    cmd = _cmd(annotations=[
-        {"start": "x", "x": "y"},     # 数值非法
-        {"start": None},              # 读取失败
-    ])
-    fc = ";".join(cmd)
-    assert "drawbox" not in fc
-    assert "null" not in fc
-    fx = cmd[cmd.index("-filter_complex") + 1]
-    assert fx == "[0:v]subtitles=s.ass:fontsdir=.[vout]"
+def test_material_cmd_video_without_in_out_raises():
+    with pytest.raises(ValueError, match="in_point"):
+        build_material_cmd(
+            "ffmpeg", src="a.mp4", out="m00_a.mp4", kind="video",
+            width=1080, height=1080, fps=60,
+        )
 
 
-def test_mix_bgm_filter_string():
+# ---------------------------------------------------------------------------
+# 音频:BGM 预混 / 转 mp3
+# ---------------------------------------------------------------------------
+
+
+def test_mix_bgm_filter_string(monkeypatch):
     """验证 BGM 预混的命令形态:atrim/asetpts/volume/apad 链 + amix normalize=0。"""
-    # mix_bgm 直接执行命令,这里通过 monkeypatch 捕获 cmd 验证组装
-    from text2video import compose
     captured = {}
-    original = compose.run_ffmpeg
-
-    def fake_run(cmd, *, cwd):
-        captured["cmd"] = cmd
-        captured["cwd"] = cwd
-
-    compose.run_ffmpeg = fake_run
-    try:
-        mix_bgm("ffmpeg", "v.mp3", "bgm.mp3", volume=0.25, duration=12.5,
-                out="out\\mix.mp3")
-    finally:
-        compose.run_ffmpeg = original
+    monkeypatch.setattr(
+        compose, "run_ffmpeg",
+        lambda cmd, *, cwd: captured.update(cmd=cmd, cwd=cwd),
+    )
+    mix_bgm("ffmpeg", "v.mp3", "bgm.mp3", volume=0.25, duration=12.5,
+            out=r"out\mix.mp3", bitrate="256k")
     cmd = captured["cmd"]
     fc = cmd[cmd.index("-filter_complex") + 1]
     assert fc == ("[1:a]atrim=0:12.500,asetpts=N/SR/TB,volume=0.25,apad[bg];"
                   "[0:a][bg]amix=inputs=2:duration=first:normalize=0[aout]")
     assert cmd[cmd.index("-map") + 1] == "[aout]"
+    assert cmd[cmd.index("-b:a") + 1] == "256k"
     assert captured["cwd"].endswith("out")
+
+
+def test_transcode_audio_to_mp3(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        compose, "run_ffmpeg",
+        lambda cmd, *, cwd: captured.update(cmd=cmd, cwd=cwd),
+    )
+    transcode_audio("ffmpeg", "voice.wav", r"out\demo.audio.mp3", bitrate="192k")
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("-i") + 1] == "voice.wav"
+    assert cmd[cmd.index("-c:a") + 1] == "libmp3lame"
+    assert cmd[cmd.index("-b:a") + 1] == "192k"
+    assert "-vn" in cmd
+    assert cmd[-1] == r"out\demo.audio.mp3"
+
+
+# ---------------------------------------------------------------------------
+# 探测
+# ---------------------------------------------------------------------------
+
+
+def test_probe_alpha_mode_reads_tag(monkeypatch):
+    monkeypatch.setattr(compose, "_ffprobe_lines", lambda fp, args, path: ["1"])
+    assert compose.probe_alpha_mode("ffprobe", "x.subs.webm") == "1"
+    monkeypatch.setattr(compose, "_ffprobe_lines", lambda fp, args, path: [])
+    assert compose.probe_alpha_mode("ffprobe", "x.webm") is None
+
+
+def test_probe_dimensions_parses_and_reports(monkeypatch):
+    monkeypatch.setattr(
+        compose, "_ffprobe_lines",
+        lambda fp, args, path: ["width=1920", "height=1080"],
+    )
+    assert compose.probe_dimensions("ffprobe", "a.png") == (1920, 1080)
+    monkeypatch.setattr(compose, "_ffprobe_lines", lambda fp, args, path: [])
+    with pytest.raises(RuntimeError, match="未读到完整尺寸"):
+        compose.probe_dimensions("ffprobe", "a.png")
+
+
+def test_probe_duration_unparsable_reports(monkeypatch):
+    monkeypatch.setattr(compose, "_ffprobe_lines", lambda fp, args, path: ["abc"])
+    with pytest.raises(RuntimeError, match="无法解析媒体时长"):
+        compose.probe_duration("ffprobe", "a.mp3")
+
+
+def test_ffprobe_failure_is_readable(monkeypatch):
+    """ffprobe 非零退出:错误信息里带 stderr,便于定位素材问题。"""
+    class _R:
+        returncode = 1
+        stdout = ""
+        stderr = "No such file"
+
+    monkeypatch.setattr(compose.subprocess, "run", lambda *a, **k: _R())
+    with pytest.raises(RuntimeError, match="No such file"):
+        compose._ffprobe_lines("ffprobe", ["-show_entries", "format=duration"], "x")

@@ -1,8 +1,8 @@
 """诊断模块:text2video doctor —— 本机运行环境逐项自检。
 
-检查项:Python/包版本、ffmpeg/ffprobe 位置与版本、系统中文字体、
-edge-tts 可用性、SAPI(Windows 本地语音)、TTS 缓存目录可写、配置文件加载;
---online 时额外测试 edge-tts 网络连通。
+检查项:Python/包版本、ffmpeg/ffprobe 位置与版本、VP9 透明编码能力、
+系统中文字体、edge-tts 可用性、SAPI(Windows 本地语音)、TTS 缓存目录可写、
+配置文件加载;--online 时额外测试 edge-tts 网络连通。
 
 每项返回 (名称, PASS|WARN|FAIL, 说明);FAIL 表示不可用,会阻塞出片。
 """
@@ -63,6 +63,29 @@ def _ffprobe_check() -> Check:
     except RuntimeError as exc:
         return ("ffprobe", "FAIL", str(exc))
     return ("ffprobe", "PASS", probe)
+
+
+def _vp9_alpha_check() -> Check:
+    """检查 libvpx-vp9 是否支持 yuva420p(透明字幕轨 subs.webm 的硬前提)。"""
+    try:
+        path = compose.find_ffmpeg()
+    except RuntimeError as exc:
+        return ("VP9 透明编码", "FAIL", str(exc))
+    try:
+        out = subprocess.run(
+            [path, "-hide_banner", "-h", "encoder=libvpx-vp9"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", check=False, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ("VP9 透明编码", "FAIL", f"{path} 无法执行")
+    text = (out.stdout or "") + (out.stderr or "")
+    if "Unknown encoder" in text or "Codec not found" in text:
+        return ("VP9 透明编码", "FAIL", "缺少 libvpx-vp9,无法产出透明字幕轨")
+    if "yuva420p" in text:
+        return ("VP9 透明编码", "PASS", "libvpx-vp9 支持 yuva420p(alpha 平面)")
+    return ("VP9 透明编码", "WARN",
+            "libvpx-vp9 未列出 yuva420p,透明字幕轨可能丢失 alpha")
 
 
 def _font_check() -> Check:
@@ -161,6 +184,7 @@ def run_all_checks(
         _edge_tts_check,
         _ffmpeg_check,
         _ffprobe_check,
+        _vp9_alpha_check,
         _font_check,
         _sapi_check,
         _cache_dir_check,

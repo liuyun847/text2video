@@ -82,8 +82,8 @@ def test_cli_config_bad_explicit_raises(tmp_path):
         _apply_config(args, argv)
 
 
-def test_render_parser_accepts_config_and_ignores_unused_keys(tmp_path, monkeypatch, caplog):
-    """render 子命令有 --config;配置中的渲染相关键(tts_backend)生效,无关键不告警。"""
+def test_produce_parser_accepts_config_and_ignores_unused_keys(tmp_path, monkeypatch, caplog):
+    """produce 子命令有 --config;配置中的产出相关键(tts_backend)生效,无关键不告警。"""
     from text2video.cli import _apply_config, build_parser
 
     cfg = tmp_path / "text2video.toml"
@@ -93,25 +93,25 @@ def test_render_parser_accepts_config_and_ignores_unused_keys(tmp_path, monkeypa
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
-    argv = ["render", "--timeline", "x.timeline.json", "--config", str(cfg)]
+    argv = ["produce", "--timeline", "x.timeline.json", "--config", str(cfg)]
     args = build_parser().parse_args(argv)
-    assert args.command == "render"
+    assert args.command == "produce"
     assert args.config == str(cfg)
-    # render 只消费 tts_backend 等渲染相关键;voice/bg_color 等仅存在于顶层
-    # namespace、render 不使用,应用后不影响渲染行为,也不应刷"未知参数"告警
+    # produce 只消费 tts_backend 等产出相关键;voice/bg_color 等在别的子命令里
+    # 才用到,应用后不影响 timeine 产出,也不应刷"未知参数"告警
     _apply_config(args, argv)
     assert args.tts_backend == "sapi"
     assert not any(r.levelname == "WARNING" for r in caplog.records)
 
 
-def test_render_explicit_backend_beats_config(tmp_path, monkeypatch):
-    """render 命令行显式 --tts-backend 时,配置不覆盖(子命令参数也要计入显式扫描)。"""
+def test_produce_explicit_backend_beats_config(tmp_path, monkeypatch):
+    """produce 命令行显式 --tts-backend 时,配置不覆盖(子命令参数也要计入显式扫描)。"""
     from text2video.cli import _apply_config, build_parser
 
     cfg = tmp_path / "text2video.toml"
     cfg.write_text('[text2video]\ntts_backend = "sapi"\n', encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    argv = ["render", "--timeline", "x.timeline.json",
+    argv = ["produce", "--timeline", "x.timeline.json",
             "--tts-backend", "edge", "--config", str(cfg)]
     args = build_parser().parse_args(argv)
     _apply_config(args, argv)
