@@ -1,0 +1,27 @@
+{
+  "name": "remotion-video",
+  "version": "0.1.0",
+  "private": true,
+  "description": "text2video 改造后的画面渲染端:按 render.json(version 1) 清单用 Remotion 合成成片",
+  "type": "module",
+  "scripts": {
+    "studio": "remotion studio src/index.ts",
+    "render": "node render.mjs --manifest examples/manifest.json --out out/demo.mp4",
+    "stills": "node render.mjs --manifest examples/manifest.json --stills 0,120,300",
+    "assets": "node examples/make-assets.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@remotion/bundler": "4.0.538",
+    "@remotion/cli": "4.0.538",
+    "@remotion/renderer": "4.0.538",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "remotion": "4.0.538"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "typescript": "^5.9.0"
+  }
+}

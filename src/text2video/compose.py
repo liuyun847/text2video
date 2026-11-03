@@ -157,6 +157,29 @@ def probe_alpha_mode(ffprobe: str, path: str) -> str | None:
     return lines[-1] if lines else None
 
 
+def probe_has_audio(ffprobe: str, path: str) -> bool:
+    """判断媒体是否带音频流(混素材原声前必须先问这一句)。
+
+    参数:
+        ffprobe: ffprobe 路径;path: 媒体文件。
+    返回:
+        True = 至少有一条音频流;False = 没有(或读不到流信息)。
+    说明:
+        素材声明 audio=true 但文件本来就没有音轨时,ffmpeg 的 [i:a] 会直接报
+        "matches no streams";先探测才能给出可读告警而不是让整条命令失败。
+    """
+    try:
+        lines = _ffprobe_lines(
+            ffprobe,
+            ["-select_streams", "a:0", "-show_entries", "stream=index",
+             "-of", "csv=p=0"],
+            path,
+        )
+    except RuntimeError:
+        return False
+    return bool(lines)
+
+
 def pick_system_font() -> str | None:
     """挑一个含中文的字体文件(供 libass 渲染 ASS 字幕)。"""
     candidates = (

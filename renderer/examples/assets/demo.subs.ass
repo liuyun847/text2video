@@ -1,0 +1,18 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1080
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Base,Microsoft YaHei,54,&H00FFFFFF,&H000000FF,&H00000000,&H00101010,0,0,0,0,100,100,0,0,1,3,1,2,40,40,140,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.10,0:00:04.20,Base,,0,0,0,,{\c&H00FFFFFF\b1}示例字幕层{\c&H009A9A9A\b0}:由 ASS 烧成透明视频
+Dialogue: 0,0:00:04.20,0:00:08.50,Base,,0,0,0,,{\c&H00FFFFFF\b1}Remotion 只做{\c&H009A9A9A\b0}视频层叠加
+Dialogue: 0,0:00:08.50,0:00:13.00,Base,,0,0,0,,{\c&H00FFFFFF\b1}透明区应透出{\c&H009A9A9A\b0}下方素材
+Dialogue: 0,0:00:13.00,0:00:18.00,Base,,0,0,0,,{\c&H00FFFFFF\b1}标注框置于{\c&H009A9A9A\b0}素材之上、字幕之下
+Dialogue: 0,0:00:18.00,0:00:24.00,Base,,0,0,0,,{\c&H00FFFFFF\b1}音轨与时长{\c&H009A9A9A\b0}由清单决定

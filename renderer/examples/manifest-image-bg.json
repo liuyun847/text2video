@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "fps": 60,
+  "width": 1080,
+  "height": 1080,
+  "duration": 24.168,
+  "durationInFrames": 1450,
+  "background": {
+    "type": "image",
+    "path": "C:\\Users\\MLTZ\\Desktop\\code\\working\\remotion-video\\examples\\assets\\shot_parallel.png"
+  },
+  "audio": {
+    "path": "C:\\Users\\MLTZ\\Desktop\\code\\working\\remotion-video\\examples\\assets\\demo.audio.mp3"
+  },
+  "subtitle": {
+    "path": "C:\\Users\\MLTZ\\Desktop\\code\\working\\remotion-video\\examples\\assets\\demo.subs.webm"
+  },
+  "materials": [
+    {
+      "type": "image",
+      "path": "C:\\Users\\MLTZ\\Desktop\\code\\working\\remotion-video\\examples\\assets\\shot_counter.png",
+      "start": 2,
+      "end": 12,
+      "fade": {
+        "in": 0.5,
+        "out": 0.5
+      }
+    }
+  ],
+  "annotations": [
+    {
+      "start": 4,
+      "end": 10,
+      "x": 0.2,
+      "y": 0.2,
+      "w": 0.6,
+      "h": 0.4,
+      "color": "0xFF3B30"
+    }
+  ],
+  "timing": {
+    "mode": "real"
+  }
+}

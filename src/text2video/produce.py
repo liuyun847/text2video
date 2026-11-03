@@ -1,12 +1,15 @@
 """产出模块:把真实时间轴加工成「Remotion 消费的中间件」(produce 子命令的实现)。
 
 产出(全部落在输出基名 base 旁,路径写进 render.json 的都是绝对路径):
-- {base}.audio.mp3     最终音轨(配音;有 BGM 时已按 mix_bgm 语义混好)
+- {base}.audio.mp3     最终音轨(配音;有 BGM 时已按 mix_bgm 语义混好;
+                        开 --loudnorm 时已做两遍 loudnorm,响度落在 -14 LUFS / -1.5 dBTP)
 - {base}.subs.webm     透明字幕轨(ASS 烧到 alpha 画布:VP9 / pix_fmt=yuva420p)
 - {base}.material/     素材中间件(逐段裁到输出画幅:video→h264 mp4 无音轨,image→png)
 - {base}.render.json   给 Remotion 的清单(契约 version 1)
 - {base}.timeline.json / .timeline.md / .preview.html  刷新为真实时间轴(v5,逐字轴落盘)
 - {base}.ass           字幕源文件(可复现 subs.webm;ASS 是纯文本,便于比对)
+- {base}.srt / .vtt    外挂字幕(平台上传用的可编辑字幕;与 ASS 同源同断行,
+                       可用 --no-sidecar-subs 关闭、--subs-formats srt,vtt 选择)
 
 与旧 render 的区别:不再合成整片 mp4,也不做音画分离;画面渲染交给 Remotion。
 ffmpeg 在这里只当"中间件生产器":量长/裁切/转码/混音/烧透明字幕。
@@ -21,7 +24,7 @@ import os
 import re
 import shutil
 
-from . import compose
+from . import audio, compose, sidecar
 from .layout import auto_fontsize, auto_max_chars, resolve_font
 from .report import render_preview_html, timeline_to_markdown
 from .subs import build_karaoke_ass, build_scroll_ass, wrap_words
@@ -498,6 +501,10 @@ def produce_timeline(
     tts_backend: str | None = None,
     cache_dir: str | None = None,
     precheck: bool = True,
+    sidecar_formats: tuple[str, ...] | None = sidecar.DEFAULT_FORMATS,
+    loudnorm: bool = False,
+    target_lufs: float = audio.DEFAULT_TARGET_LUFS,
+    true_peak: float = audio.DEFAULT_TRUE_PEAK,
 ) -> int:
     """把一份时间线(或"只当参数容器"的时间线)产出成 Remotion 中间件。
 
@@ -506,13 +513,22 @@ def produce_timeline(
             force 忽略时间线自检错误(素材文件缺失仍硬失败);
             tts_backend / cache_dir 覆盖语音引擎与缓存目录;
             precheck=False 跳过输入时间线自检(一键路径的输入是估算轴容器,
-            真实轴建好后仍会完整自检)。
-    返回:0 成功;自检不过抛 SystemExit(2);ffmpeg/ffprobe 失败抛 RuntimeError。
+            真实轴建好后仍会完整自检);
+            sidecar_formats 外挂字幕格式(SRT/VTT),空元组 = 不导出;
+            loudnorm 音轨落盘后是否再做两遍 loudnorm 母带(默认关,make 的纯文本路径会开);
+            target_lufs / true_peak 母带目标(仅 loudnorm=True 时有意义)。
+    返回:0 成功;自检不过抛 SystemExit(2);ffmpeg/ffprobe 失败抛 RuntimeError;
+          loudnorm 参数越界或母带失败抛 audio.AudioError(RuntimeError)。
+    副作用:写中间件与时间线三件套;loudnorm=True 时原地覆盖 {base}.audio.mp3。
     """
     base = os.path.abspath(os.path.expanduser(base))
     out_dir = os.path.dirname(base)
     stem = os.path.basename(base)
     os.makedirs(out_dir, exist_ok=True)
+
+    if loudnorm:
+        # 目标越界尽早报错:别等整段 TTS 跑完才发现 loudnorm 参数非法
+        audio.validate_target(target_lufs, true_peak)
 
     ffmpeg = compose.find_ffmpeg()
     ffprobe = compose.find_ffprobe(ffmpeg)
@@ -579,6 +595,20 @@ def produce_timeline(
         if os.path.exists(voice_tmp):
             os.remove(voice_tmp)
     LOG.info("最终音轨: %s(%.3f 秒)", audio_path, duration)
+
+    # ---- 2.5) 可选响度母带:两遍 loudnorm,让纯文本路径的响度也达标 ----
+    if loudnorm:
+        LOG.info("响度母带:两遍 loudnorm(目标 %.1f LUFS / %.1f dBTP)...",
+                 target_lufs, true_peak)
+        loudness, notes = audio.apply_loudnorm_inplace(
+            ffmpeg, audio_path, target_lufs=target_lufs, true_peak=true_peak,
+        )
+        for note in notes:
+            LOG.warning("响度母带: %s", note)
+        # 母带重编码会带来毫秒级时长变化,重新量一次,别让时间线与音轨差一帧
+        duration = compose.probe_duration(ffprobe, audio_path)
+        print(audio.summary_line(loudness))
+        LOG.info("响度母带完成: %s(%.3f 秒)", audio_path, duration)
 
     # ---- 3) 真实时间轴(v5:逐字轴落盘)+ 估算偏差报告 ----
     material_dicts: list[dict] = []
@@ -670,6 +700,14 @@ def produce_timeline(
         f.write("\n")
     write_timeline_artifacts(real_tl, base, audio_ref=os.path.basename(audio_path))
 
+    # ---- 7) 外挂字幕(SRT/VTT):平台上传用的可编辑字幕,与 ASS 同源同断行 ----
+    if sidecar_formats:
+        try:
+            sidecar.write_sidecars(real_tl, base, sidecar_formats)
+        except ValueError as exc:
+            # 字幕格式非法/无语音段时只告警:中间件已经产出,不让这一步回滚整次产出
+            LOG.warning("外挂字幕未导出: %s", exc)
+
     LOG.info("产出完成(%d 帧 @ %dfps): %s", render["durationInFrames"], fps, base)
     return 0
 
@@ -681,6 +719,10 @@ def produce_from_timeline(
     force: bool = False,
     tts_backend: str | None = None,
     cache_dir: str | None = None,
+    sidecar_formats: tuple[str, ...] | None = sidecar.DEFAULT_FORMATS,
+    loudnorm: bool = False,
+    target_lufs: float = audio.DEFAULT_TARGET_LUFS,
+    true_peak: float = audio.DEFAULT_TRUE_PEAK,
 ) -> int:
     """从 timeline.json 产出中间件;base 缺省=timeline 路径剥掉 .timeline.json。"""
     tl = Timeline.from_json(timeline_json)
@@ -688,4 +730,6 @@ def produce_from_timeline(
         tl,
         base=base or timeline_json_to_base(timeline_json),
         force=force, tts_backend=tts_backend, cache_dir=cache_dir,
+        sidecar_formats=sidecar_formats,
+        loudnorm=loudnorm, target_lufs=target_lufs, true_peak=true_peak,
     )

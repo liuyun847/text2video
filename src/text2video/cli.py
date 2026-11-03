@@ -7,6 +7,11 @@ produce 产出发给 Remotion 的中间件(音轨 / 透明字幕轨 / 素材片�
 子命令:
   plan    生成时间线产物(默认离线估算,不联网)
   produce 读取 timeline.json(或直接从文案现建),产出中间件(自检不过默认拒绝)
+  edit    剪辑层:按 edit.json 拼 mezzanine 画面流 + 混一条母带,并回填 render.json
+  render  出片:把 produce 的 render.json 交给内置 Remotion 渲染端(renderer/)渲染
+  deliver 交付:成片 -> 横/竖/方多规格 + 封面 + 响度复核 + 音画对位校验 + 交付报告
+  make    一键:把上面五个阶段串起来(plan -> produce ->(可选)edit -> render -> deliver),
+          每阶段失败立即停止;纯文本路径默认给音轨加响度母带(--loudnorm)
   cover   生成封面图(背景 + 标题大字,输出 PNG)
   doctor  环境自检(ffmpeg/ffprobe/字体/edge-tts/SAPI/缓存目录/配置)
 无子命令时保持一键用法(建真实时间轴 + produce 一次完成)。
@@ -21,6 +26,8 @@ import os
 import sys
 from collections.abc import Sequence
 
+from .audio import DEFAULT_TARGET_LUFS as _DEFAULT_TARGET_LUFS
+from .audio import DEFAULT_TRUE_PEAK as _DEFAULT_TRUE_PEAK
 from .layout import (
     auto_fontsize as _auto_fontsize,
 )
@@ -37,6 +44,7 @@ from .produce import (
     synthesize_with_backend,
     write_timeline_artifacts,
 )
+from .sidecar import parse_formats as _parse_subs_formats
 from .timeline import (
     build_timeline,
     check_material_files,
@@ -128,11 +136,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="text2video",
         description="文案转中间件:两阶段(plan 审片 → produce 产出),输入文本生成多轨对齐"
-                    "时间线,确认后产出音轨 / 透明字幕轨 / 素材片段 / render.json 交给 Remotion"
+                    "时间线,确认后产出音轨 / 透明字幕轨 / 素材片段 / render.json;"
+                    "render 用内置 Remotion 渲染端(renderer/)出成片"
                     "(默认 1:1 方画幅 1080x1080)。",
     )
     _add_common_args(p)
-    subs = p.add_subparsers(title="子命令", dest="command", metavar="{plan, produce}")
+    subs = p.add_subparsers(
+        title="子命令", dest="command",
+        metavar="{plan, produce, edit, render, deliver, make, cover, doctor}",
+    )
 
     sp = subs.add_parser(
         "plan", parents=[_add_common_args_p()],
@@ -151,8 +163,124 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--timeline", default=None,
                     help="timeline.json 路径(与 --text/--file 二选一);缺省则从文案现建")
     pr.add_argument("--force", action="store_true", help="忽略一致性自检错误,强制产出")
+    pr.add_argument("--no-sidecar-subs", action="store_true",
+                    help="不额外导出外挂字幕(默认导出 {基名}.srt 与 .vtt)")
+    pr.add_argument("--subs-formats", default="srt,vtt", metavar="LIST",
+                    help="外挂字幕格式,逗号分隔: srt,vtt(默认两者都出)")
+    pr.add_argument("--loudnorm", action="store_true",
+                    help="音轨落盘后再做两遍 loudnorm 母带,让响度达标"
+                         "(默认关;deliver 的响度复核就是量它)")
+    pr.add_argument("--target-lufs", type=float, default=_DEFAULT_TARGET_LUFS, metavar="LUFS",
+                    help=f"响度母带目标 integrated LUFS(默认 {_DEFAULT_TARGET_LUFS:g},仅 --loudnorm 时生效)")
+    pr.add_argument("--true-peak", type=float, default=_DEFAULT_TRUE_PEAK, metavar="DBTP",
+                    help=f"响度母带真峰值上限 dBTP(默认 {_DEFAULT_TRUE_PEAK:g},仅 --loudnorm 时生效)")
     # 与顶层共用参数集,但产物基名缺省跟着 --timeline 走(None=由 timeline 路径推导)
     pr.set_defaults(out=None)
+
+    ed = subs.add_parser(
+        "edit",
+        help="剪辑层:按 edit.json 拼 mezzanine 画面流 + 混一条母带,并回填 render.json",
+        description="剪辑层:读 timeline.json(时长/画幅/fps/配音)与 edit.json(段内 in/out、"
+                    "变速、转场、素材原声、BGM),产出 {base}.mezzanine.mp4(**无音轨**画面流)、"
+                    "{base}.mixed.mp3(配音 + 素材原声 + BGM 的母带,含 sidechain ducking 与"
+                    "两遍 loudnorm)、{base}.edit.report.json;并把 {base}.render.json 回填成"
+                    "单段素材(原文件先备份为 {base}.render.json.bak)。",
+    )
+    ed.add_argument("--timeline", required=True, metavar="JSON",
+                    help="produce 产出的 {base}.timeline.json(提供时长/画幅/fps/配音)")
+    ed.add_argument("--edit", required=True, metavar="JSON",
+                    help="剪辑清单 edit.json(里面的相对路径按该文件所在目录解析)")
+    ed.add_argument("--out", default=None, metavar="BASE",
+                    help="产物基名;缺省=timeline 路径去掉 .timeline.json")
+    ed.add_argument("--force", action="store_true",
+                    help="覆盖已存在的 mezzanine/母带/报告(默认拒绝,防误覆盖)")
+    ed.add_argument("--log", default="INFO", help="日志级别 DEBUG/INFO/WARNING")
+
+    rd = subs.add_parser(
+        "render",
+        help="出片:调内置 Remotion 渲染端(renderer/render.mjs)把 render.json 渲染成 mp4",
+        description="出片:把 produce 产出的 {base}.render.json 交给内置渲染端渲染整片;"
+                    "node 与 renderer/ 由本命令按包根自行定位(不依赖当前目录)。",
+    )
+    rd.add_argument("--manifest", required=True, metavar="JSON",
+                    help="produce 产出的 {base}.render.json(相对路径按当前目录解析)")
+    rd.add_argument("--out", default=None, metavar="MP4",
+                    help="成片路径,相对路径按当前目录解析;" \
+                         "缺省用渲染端默认 renderer/out/demo.mp4")
+    rd.add_argument("--stills", default=None, metavar="帧列表",
+                    help="只出 PNG 静帧并透传给渲染端,如 0,120(此时不出 mp4)")
+    rd.add_argument("--stills-dir", default=None, metavar="DIR",
+                    help="静帧目录,相对路径按当前目录解析(缺省 renderer/out/)")
+    rd.add_argument("--log", default="INFO", help="日志级别 DEBUG/INFO/WARNING")
+
+    dl = subs.add_parser(
+        "deliver",
+        help="交付:成片 -> 横/竖/方多规格 + 封面 + 响度复核 + 音画对位校验 + 交付报告",
+        description="把成片 mp4 加工成交付包:多规格(landscape 原样 / portrait 1080x1920 / "
+                    "square 1080x1080)、封面抽帧、ebur128 响度结论、silencedetect 对位偏差,"
+                    "最后写 {out}/" + "deliver.report.md。",
+    )
+    dl.add_argument("--video", required=True, metavar="MP4",
+                    help="成片 mp4(相对路径按当前目录解析)")
+    dl.add_argument("--out", default="out/deliver", metavar="DIR",
+                    help="交付目录(默认 out/deliver)")
+    dl.add_argument("--specs", default="landscape,portrait,square", metavar="LIST",
+                    help="要交付的规格,逗号分隔: landscape,portrait,square")
+    dl.add_argument("--cover-at", default="1.0", metavar="LIST",
+                    help="封面抽帧时间点,逗号分隔;>=1 视为秒,0~1 视为全片比例(默认 1.0)")
+    dl.add_argument("--fit", choices=("blur", "crop"), default="blur",
+                    help="竖/方规格的画面适配:blur=模糊背景填充(默认,四周无黑边);"
+                         "crop=居中裁切")
+    dl.add_argument("--timeline", default=None, metavar="JSON",
+                    help="timeline.json(可选):决定 landscape 画幅,并启用音画对位校验")
+    dl.add_argument("--lufs-target", type=float, default=-14.0,
+                    help="响度目标 integrated LUFS(默认 -14)")
+    dl.add_argument("--dbtp-target", type=float, default=-1.5,
+                    help="真峰值上限 dBTP(默认 -1.5)")
+    dl.add_argument("--sync-tolerance", type=float, default=0.25,
+                    help="音画对位偏差阈值(秒,默认 0.25)")
+    dl.add_argument("--crf", type=int, default=20,
+                    help="重编码规格的 x264 质量(默认 20;流复制路径不受影响)")
+    dl.add_argument("--preset", default="medium", help="x264 预设")
+    dl.add_argument("--log", default="INFO", help="日志级别 DEBUG/INFO/WARNING")
+
+    mk = subs.add_parser(
+        "make", parents=[_add_common_args_p()],
+        help="一键:plan -> produce ->(可选)edit -> render -> deliver,产物与报告一次成型",
+        description="一键编排:把 plan / produce / edit / render / deliver 串成一条命令,"
+                    "每阶段打印耗时与产物,任一阶段失败立即停止并报出阶段名;"
+                    "纯文本路径(无 --edit)默认给音轨加响度母带(--loudnorm)。",
+    )
+    mk.add_argument("--edit", default=None, metavar="JSON",
+                    help="剪辑清单 edit.json(可省略):给了才执行 edit 阶段"
+                         "(它会先回填 {base}.render.json,再由 render 出片)")
+    mk.add_argument("--specs", default="landscape,portrait,square", metavar="LIST",
+                    help="交付的多规格,逗号分隔: landscape,portrait,square"
+                         "(透传 deliver,默认全出)")
+    mk.add_argument("--cover-at", default="1.0", metavar="LIST",
+                    help="封面抽帧时间点,逗号分隔(透传 deliver;>=1 视为秒,0~1 视为全片比例)")
+    mk.add_argument("--fit", choices=("blur", "crop"), default="blur",
+                    help="竖/方规格的画面适配(透传 deliver):blur=模糊背景填充(默认),crop=居中裁切")
+    mk.add_argument("--skip", default="", metavar="LIST",
+                    help="跳过的阶段,逗号分隔: plan,produce,edit,render,deliver"
+                         "(跳过 plan/produce 时可直接对已有产物补跑 render+deliver)")
+    mk.add_argument("--force", action="store_true",
+                    help="覆盖已有产物(produce=忽略自检错误,edit=允许覆盖上一轮画面流/母带)")
+    mk.add_argument("--loudnorm", action="store_true", default=None,
+                    help="给 produce 的音轨加两遍 loudnorm 母带;缺省=无 --edit 时自动开、"
+                         "有 --edit 时关(剪辑层的母带本身已做响度处理)")
+    mk.add_argument("--target-lufs", type=float, default=_DEFAULT_TARGET_LUFS, metavar="LUFS",
+                    help=f"响度目标 integrated LUFS(默认 {_DEFAULT_TARGET_LUFS:g};"
+                         "同时作为 deliver 的复核目标)")
+    mk.add_argument("--true-peak", type=float, default=_DEFAULT_TRUE_PEAK, metavar="DBTP",
+                    help=f"真峰值上限 dBTP(默认 {_DEFAULT_TRUE_PEAK:g};"
+                         "同时作为 deliver 的复核上限)")
+    mk.add_argument("--sync-tolerance", type=float, default=0.25,
+                    help="音画对位偏差阈值(秒,透传 deliver;默认 0.25)")
+    mk.add_argument("--no-sidecar-subs", action="store_true",
+                    help="不额外导出外挂字幕(透传 produce)")
+    mk.add_argument("--subs-formats", default="srt,vtt", metavar="LIST",
+                    help="外挂字幕格式,逗号分隔: srt,vtt(透传 produce)")
 
     cv = subs.add_parser(
         "cover",
@@ -269,6 +397,34 @@ def _base_from_out(out: str) -> str:
     return os.path.splitext(out)[0]
 
 
+def _sidecar_formats(args: argparse.Namespace) -> tuple[str, ...]:
+    """解析外挂字幕格式:--no-sidecar-subs 关掉;--subs-formats 非法时给可读报错。
+
+    返回空元组表示"不导出"(produce 侧据此跳过写文件)。
+    """
+    if getattr(args, "no_sidecar_subs", False):
+        return ()
+    try:
+        return _parse_subs_formats(getattr(args, "subs_formats", None))
+    except ValueError as exc:
+        raise SystemExit(f"错误: {exc}") from None
+
+
+def _loudnorm_opts(args: argparse.Namespace) -> dict:
+    """收集响度母带参数传给 produce(默认关;目标缺省 -14 LUFS / -1.5 dBTP)。
+
+    参数:
+        args: 命令行命名空间;老路径(顶层一键/无该选项的子命令)按 getattr 兜底。
+    返回:
+        {"loudnorm": bool, "target_lufs": float, "true_peak": float}。
+    """
+    return {
+        "loudnorm": bool(getattr(args, "loudnorm", False)),
+        "target_lufs": float(getattr(args, "target_lufs", _DEFAULT_TARGET_LUFS)),
+        "true_peak": float(getattr(args, "true_peak", _DEFAULT_TRUE_PEAK)),
+    }
+
+
 def _plan_core(text: str, base: str, meta: dict, *, real: bool,
                materials_path: str | None = None, cache_dir: str | None = None):
     """核心 plan:构建并落盘时间线产物。返回 (tl, timings, audio_ref)。
@@ -354,6 +510,7 @@ def run_produce(args: argparse.Namespace) -> int:
         return produce_from_timeline(
             timeline_path, base=args.out, force=args.force,
             tts_backend=args.tts_backend, cache_dir=_cache_dir_arg(args),
+            sidecar_formats=_sidecar_formats(args), **_loudnorm_opts(args),
         )
 
     text = _resolve_text(args).strip()
@@ -375,10 +532,46 @@ def run_produce(args: argparse.Namespace) -> int:
         assets=assets, material=material, bgm=bgm, annotations=annotations,
     )
     return produce_timeline(
-        tl, base=base, force=args.force,
+        tl, base=base, force=getattr(args, "force", False),
         tts_backend=args.tts_backend, cache_dir=_cache_dir_arg(args),
-        precheck=False,
+        precheck=False, sidecar_formats=_sidecar_formats(args),
+        **_loudnorm_opts(args),
     )
+
+
+def run_render(args: argparse.Namespace) -> int:
+    """出片入口:把 render.json 交给内置 Remotion 渲染端(renderer/render.mjs)。
+
+    参数:
+        args: 含 manifest / out / stills / stills_dir 的命令行命名空间。
+
+    返回值:
+        int: 0 = 成功;非 0 = node 的退出码(原样作为本进程退出码)。
+    """
+    from .renderer import run_render as _run_renderer
+
+    return _run_renderer(
+        args.manifest, out=args.out, stills=args.stills, stills_dir=args.stills_dir,
+    )
+
+
+def run_deliver(args: argparse.Namespace) -> int:
+    """交付入口:多规格 + 封面 + 响度复核 + 对位校验 + 报告(实现都在 deliver.py)。
+
+    参数非法(规格/适配方式/封面时间点)转成可读报错(退出码由 SystemExit 给出);
+    ffmpeg 失败抛 RuntimeError,由 main 统一打印为"错误: ..."并返回 1。
+    """
+    from .deliver import deliver
+
+    try:
+        return deliver(
+            args.video, out=args.out, specs=args.specs, cover_at=args.cover_at,
+            timeline=args.timeline, fit=args.fit,
+            lufs_target=args.lufs_target, dbtp_target=args.dbtp_target,
+            sync_tolerance=args.sync_tolerance, crf=args.crf, preset=args.preset,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"错误: {exc}") from None
 
 
 def run_cover(args: argparse.Namespace) -> int:
@@ -471,6 +664,18 @@ def _dispatch(args: argparse.Namespace) -> int:
         return run_plan(args)
     if args.command == "produce":
         return run_produce(args)
+    if args.command == "edit":
+        from .edit import run_edit as _run_edit
+
+        return _run_edit(args)
+    if args.command == "render":
+        return run_render(args)
+    if args.command == "deliver":
+        return run_deliver(args)
+    if args.command == "make":
+        from .make import run_make as _run_make
+
+        return _run_make(args)
     if args.command == "cover":
         return run_cover(args)
     if args.command == "doctor":
@@ -484,7 +689,12 @@ def _apply_config(args: argparse.Namespace, argv: Sequence[str] | None = None) -
     通过原始 argv 判断哪些参数是命令行显式给出的(即使值恰等于默认值),
     这些键不被配置覆盖;其余键仅当 args 中仍为默认值时用配置值覆盖。
     显式 --config 解析失败直接报错;默认搜索到的配置文件损坏时仅告警忽略。
+
+    render / deliver 子命令不参与合并:它们的 --manifest / --out 是"路径"而非排版参数,
+    配置里的 out(产物基名)若被套用会落成无扩展名的"成片"或错位的交付目录。
     """
+    if getattr(args, "command", None) in ("render", "deliver"):
+        return
     from .config import find_config, load_config
 
     parser = build_parser()

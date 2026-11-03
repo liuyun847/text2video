@@ -14,6 +14,20 @@ out/
 *.webm
 *.ass
 
+# Remotion 渲染端(renderer/):原独立仓库 remotion-video 已并入,以下与其原 .gitignore 等价
+# node_modules 可 npm ci 重建;out/ public/run/ public/probe/ work-tmp/ 都是渲染中间态
+renderer/node_modules/
+renderer/out/
+renderer/public/run/
+renderer/public/probe/
+renderer/work-tmp/
+renderer/*.log
+# renderer 的样例素材本来就在版本库里(原仓库入库),别被上面的 *.mp4/*.mp3/*.webm/*.ass 吞掉
+!renderer/examples/assets/*.mp3
+!renderer/examples/assets/*.mp4
+!renderer/examples/assets/*.webm
+!renderer/examples/assets/*.ass
+
 # IDE
 .idea/
 .vscode/

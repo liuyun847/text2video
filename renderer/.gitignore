@@ -1,0 +1,7 @@
+# 依赖与构建产物
+node_modules/
+work-tmp/
+out/
+public/run/
+public/probe/
+*.log

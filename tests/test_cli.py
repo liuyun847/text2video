@@ -63,7 +63,10 @@ def test_parser_subcommands_plan_and_produce():
     # produce 也支持直接从文案现建(一键用法同一套参数)
     pr2 = p.parse_args(["produce", "--text", "你好", "--out", "out/y", "--force"])
     assert pr2.text == "你好" and pr2.out == "out/y" and pr2.force is True
-    # 旧 render 子命令已移除
+    # render 子命令仍在,但只做"把清单交给内置渲染端出片"(旧 ffmpeg 整片合成的参数已移除)
+    rd = p.parse_args(["render", "--manifest", "out/x.render.json"])
+    assert rd.command == "render" and rd.manifest == "out/x.render.json"
+    assert rd.out is None and rd.stills is None and rd.stills_dir is None
     with pytest.raises(SystemExit):
         p.parse_args(["render", "--timeline", "x.timeline.json"])
 
